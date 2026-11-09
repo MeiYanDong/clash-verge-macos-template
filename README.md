@@ -29,7 +29,11 @@ flowchart LR
 
 ## 先离线体验
 
+从 GitHub 获取模板后，在仓库目录执行：
+
 ```sh
+git clone https://github.com/MeiYanDong/clash-verge-macos-template.git
+cd clash-verge-macos-template
 node scripts/toolkit.mjs init --out .private/config.json
 # 编辑自己的私有配置；示例不能部署。
 node scripts/toolkit.mjs render --config examples/config.example.json --out .private/demo --demo
@@ -62,4 +66,4 @@ npm run pack:public
 - `tests/`：隔离的状态机、路由、参数化、隐私和安装包测试。
 - `.private/`：使用者私有输入与测试／安装产物，已排除分享。
 
-本地模板不等于已公开开源发布。许可状态与第三方说明见 [许可说明](LICENSE-NOTICE.md)和[第三方清单](THIRD-PARTY-NOTICES.md)。
+仓库公开可见，工程整体的开源许可证尚未指定；第三方代码继续遵循其原有许可证。详见 [许可说明](LICENSE-NOTICE.md)和[第三方清单](THIRD-PARTY-NOTICES.md)。
