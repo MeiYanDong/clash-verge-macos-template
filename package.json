@@ -1,0 +1,15 @@
+{
+  "name": "clash-verge-macos-template",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Parameterized Clash/Mihomo routing and a macOS Tokyo residential gateway",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "check": "node scripts/check.mjs",
+    "audit:public": "node scripts/public-audit.mjs",
+    "demo": "node scripts/toolkit.mjs render --config examples/config.example.json --out .private/demo --demo",
+    "pack:public": "node scripts/pack-public.mjs"
+  }
+}

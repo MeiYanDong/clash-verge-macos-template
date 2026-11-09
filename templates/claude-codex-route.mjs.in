@@ -1,0 +1,111 @@
+// Codex-only child environment. The calling Claude shell keeps its Tokyo proxy.
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
+
+export const CODEX_BINARY = '@@CODEX_BINARY@@';
+export const CODEX_ALIASES = [CODEX_BINARY,
+  '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+  '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/../CodexCLI.app/Contents/MacOS/codex'];
+export const US_PROXY = 'http://127.0.0.1:@@MAIN_PORT@@';
+export const MAIN_SOCKET = '@@MAIN_SOCKET@@';
+export const US_GROUP = 'ChatGPT · 美国静态住宅';
+const fail = reason => { throw Error(`CLAUDE_CODEX_${reason}`); };
+const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+
+export function codexEnvironment(root, original = process.env) {
+  const env = { ...original };
+  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) env[key] = US_PROXY;
+  env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
+  // Do not give Codex's own tools Claude's SSH/Git wrappers.
+  env.PATH = (env.PATH || '/usr/bin:/bin').split(':').filter(p => p !== path.join(root, 'bin')).join(':');
+  if (env.GIT_SSH_COMMAND === quote(path.join(root, 'bin/ssh'))) delete env.GIT_SSH_COMMAND;
+  return env;
+}
+
+// Parse command positions only. Unsupported/indirect forms must use the
+// explicit launcher; never guess at assignments or rewrite data arguments.
+export function rewriteCodexCommand(command, root) {
+  if (!CODEX_ALIASES.some(alias => command.includes(alias))) return command;
+  const result = spawnSync('/usr/bin/python3', ['-I', fileURLToPath(new URL('./codex-shell-rewrite.py', import.meta.url))], {
+    input: JSON.stringify({ command, aliases: CODEX_ALIASES, wrapper: path.join(root, 'bin/codex') }),
+    encoding: 'utf8', timeout: 3000, maxBuffer: 2 * 1024 * 1024,
+    env: { PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8' }
+  });
+  if (result.status !== 0) fail('USE_EXPLICIT_CODEX_WRAPPER');
+  let value; try { value = JSON.parse(result.stdout); } catch { fail('COMMAND_PARSER_FAILED'); }
+  if (typeof value.command !== 'string') fail('COMMAND_PARSER_FAILED');
+  return value.command;
+}
+
+export function mainApi(route) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ socketPath: MAIN_SOCKET, path: route, method: 'GET' }, res => {
+      let body = ''; res.setEncoding('utf8');
+      res.on('aborted', () => reject(Error('CLAUDE_CODEX_CONTROLLER_ABORTED')));
+      res.on('error', () => reject(Error('CLAUDE_CODEX_CONTROLLER_UNAVAILABLE')));
+      res.on('data', chunk => { body += chunk; if (body.length > 8 * 1024 * 1024) req.destroy(Error('CLAUDE_CODEX_CONTROLLER_SIZE')); });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(Error('CLAUDE_CODEX_CONTROLLER_STATUS'));
+        try { resolve(JSON.parse(body)); } catch { reject(Error('CLAUDE_CODEX_CONTROLLER_FORMAT')); }
+      });
+    });
+    req.setTimeout(3000, () => req.destroy(Error('CLAUDE_CODEX_CONTROLLER_TIMEOUT')));
+    req.on('error', () => reject(Error('CLAUDE_CODEX_CONTROLLER_UNAVAILABLE'))); req.end();
+  });
+}
+
+export function rulesDigest(rules) {
+  if (!Array.isArray(rules)) fail('RULES_INVALID');
+  return crypto.createHash('sha256').update(JSON.stringify(rules.map(({ type, payload, proxy }) => ({ type, payload, proxy })))).digest('hex');
+}
+
+export function assertUSPolicy(config, proxies, rules, expectedRulesHash) {
+  if (!/^[a-f0-9]{64}$/.test(expectedRulesHash || '')) fail('RULES_BASELINE_REQUIRED');
+  if (rulesDigest(rules.rules) !== expectedRulesHash) fail('RULES_CHANGED');
+  if (config.mode !== 'rule' || config['mixed-port'] !== @@MAIN_PORT@@ || config.tun?.enable !== true) fail('MAIN_PROXY_POLICY_CHANGED');
+  const group = proxies.proxies?.[US_GROUP], exit = proxies.proxies?.['US-RESIDENTIAL'];
+  if (group?.now !== 'US-RESIDENTIAL' || JSON.stringify(group.all) !== '["US-RESIDENTIAL"]' || exit?.type !== 'Socks5') fail('US_RESIDENCE_POLICY_CHANGED');
+  for (const domain of ['chatgpt.com', 'openai.com']) {
+    const rule = rules.rules?.find(r => r.type === 'DomainSuffix' && r.payload === domain);
+    if (rule?.proxy !== US_GROUP) fail('OPENAI_RULE_CHANGED');
+  }
+}
+
+export function traceThroughUS(url, env, run = spawnSync) {
+  const r = run('/usr/bin/curl', ['-q', '--proxy', US_PROXY, '--noproxy', '', '--connect-timeout', '6', '--max-time', '12',
+    '--fail', '--silent', '--show-error', url], { env, encoding: 'utf8', timeout: 14000, maxBuffer: 65536 });
+  if (r.status !== 0) fail('US_EXIT_UNAVAILABLE');
+  const fields = Object.fromEntries((r.stdout || '').split(/\r?\n/).filter(l => l.includes('=')).map(l => { const i = l.indexOf('='); return [l.slice(0, i), l.slice(i + 1)]; }));
+  if (!fields.ip || fields.loc !== 'US') fail('US_EXIT_UNVERIFIED');
+  return { ip: fields.ip, country: fields.loc, colo: fields.colo };
+}
+
+export async function verifyUSRoute(policy, env, api = mainApi, probe = traceThroughUS) {
+  if (policy.binary !== CODEX_BINARY || policy.proxy !== US_PROXY || !/^\d{1,3}(\.\d{1,3}){3}$/.test(policy.expectedExitIP || '')) fail('PROFILE_INVALID');
+  const [config, proxies, rules] = await Promise.all(['/configs', '/proxies', '/rules'].map(p => api(p)));
+  assertUSPolicy(config, proxies, rules, policy.rulesHash);
+  const exit = probe('https://chatgpt.com/cdn-cgi/trace', env);
+  if (exit.ip !== policy.expectedExitIP) fail('US_EXIT_CHANGED');
+  // Re-read after the probe; never approve changes that occurred during it.
+  const after = await Promise.all(['/configs', '/proxies', '/rules'].map(p => api(p)));
+  assertUSPolicy(...after, policy.rulesHash);
+  return { proxy: US_PROXY, route: US_GROUP, exit, verifiedAt: new Date().toISOString() };
+}
+
+export async function runCodex(args, profile) {
+  const env = codexEnvironment(profile.root), policy = profile.codex;
+  const checked = await verifyUSRoute(policy, env);
+  // Never log the prompt, command line, credentials or full inherited env.
+  const child = spawn(CODEX_BINARY, args, { env, stdio: 'inherit' });
+  const receipt = { ...checked, childPid: child.pid, parentPid: process.pid,
+    means: 'preflight_exit_verified_and_codex_spawned; observe_connections_for_runtime_route', at: new Date().toISOString() };
+  const dest = path.join(profile.root, 'last-codex-us-start.json'), temp = `${dest}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600, flag: 'wx' }); fs.renameSync(temp, dest);
+  child.once('error', () => { console.error('CLAUDE_CODEX_CHILD_START_FAILED'); process.exitCode = 125; });
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => child.kill(sig));
+  await new Promise(resolve => child.once('exit', (code, signal) => { process.exitCode = code ?? (signal === 'SIGINT' ? 130 : 143); resolve(); }));
+}

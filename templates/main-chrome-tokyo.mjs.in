@@ -1,0 +1,216 @@
+// Main-user, application-level Chrome routing. NOT an OS firewall or fingerprint isolation.
+// Does not read existing browser profiles, Cookies, Keychain, or Claude credentials.
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import http from 'node:http';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export const FORMAT = 'main-chrome-tokyo-v1';
+export const ROOT = '@@BROWSER_ROOT@@';
+export const DATA = '@@BROWSER_DATA@@';
+export const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+export const NODE = '@@SYSTEM_ROOT@@/bin/node';
+export const PROXY = 'http://127.0.0.1:@@GATE_PORT@@';
+export const EXPECTED_IP = '@@TOKYO_IP@@';
+export const SOURCES = ['https://api.ipify.org', 'https://icanhazip.com'];
+export const APP = '@@BROWSER_APP@@';
+export const ENTRY = '@@BROWSER_ENTRY@@';
+export const sha = v => crypto.createHash('sha256').update(v).digest('hex');
+const fail = code => { throw Error('TOKYO_BROWSER_' + code); };
+export function noLinks(file) {
+  for (let p = path.resolve(file); p !== path.dirname(p); p = path.dirname(p)) {
+    try { if (fs.lstatSync(p).isSymbolicLink()) fail('SYMLINK_REFUSED'); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
+}
+export function readFile(file, uid = @@MAIN_UID@@) {
+  noLinks(file);
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const s = fs.fstatSync(fd);
+    if (!s.isFile() || s.uid !== uid || s.nlink !== 1 || (s.mode & 0o022) || s.size > 4194304) fail('UNSAFE_FILE');
+    return fs.readFileSync(fd);
+  } finally { fs.closeSync(fd); }
+}
+export function mainOnly() {
+  if (process.platform !== 'darwin' || process.getuid() !== @@MAIN_UID@@ || process.geteuid() !== @@MAIN_UID@@ ||
+      process.env.HOME !== '@@HOME@@') fail('MAIN_USER_ONLY');
+}
+export function safeDirectory(p) {
+  noLinks(p); const s = fs.lstatSync(p);
+  if (!s.isDirectory() || s.uid !== @@MAIN_UID@@ || (s.mode & 0o077)) fail('UNSAFE_DIRECTORY');
+}
+export function chromeArgs(homeUrl) {
+  const url = new URL(homeUrl);
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port ||
+      !/^\/[a-f0-9]{48}\/$/.test(url.pathname) || url.search || url.hash || url.username || url.password) fail('INVALID_START_PAGE');
+  return [`--user-data-dir=${DATA}`, `--proxy-server=${PROXY}`, '--proxy-bypass-list=localhost;127.0.0.1;[::1]',
+    '--disable-quic', '--disable-sync',
+    '--no-first-run', '--no-default-browser-check', '--new-window', homeUrl];
+  // Loopback is retained for local OAuth callbacks; Chromium also has implicit
+  // link-local bypasses. There is no Internet DIRECT fallback. WebRTC is NOT
+  // claimed enforced by an unverified/obsolete command-line switch.
+}
+export function cleanEnvironment(original = process.env) {
+  const out = {};
+  for (const key of ['HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', '__CF_USER_TEXT_ENCODING'])
+    if (typeof original[key] === 'string') out[key] = original[key];
+  out.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+  return out;
+}
+export function policiesOkay(p) {
+  return p?.uid === @@MAIN_UID@@ && Array.isArray(p.policies) && p.policies.length === 4 &&
+    p.policies.every(v => v.present === false || (v.forced === true && v.matches === true)) &&
+    Array.isArray(p.conflicts) && p.conflicts.length === 2 && p.conflicts.every(v => v.present === false);
+}
+function policyRead(root) {
+  const r = spawnSync(path.join(root, 'chrome-policy-readback'), [], { encoding: 'utf8', timeout: 5000, maxBuffer: 8192 });
+  if (r.status !== 0 || r.error) fail('POLICY_READ_FAILED');
+  const p = JSON.parse(r.stdout); if (!policiesOkay(p)) fail('POLICY_CONFLICT'); return p;
+}
+export function installed(root = ROOT) {
+  mainOnly(); safeDirectory(root); safeDirectory(DATA);
+  const p = JSON.parse(readFile(path.join(root, 'manifest.json')));
+  if (p.format !== FORMAT || p.root !== ROOT || p.data !== DATA || p.proxy !== PROXY ||
+      JSON.stringify(Object.keys(p.hashes ?? {}).sort()) !== JSON.stringify(['chrome-policy-readback', 'extension/background.js', 'extension/bridge.js', 'extension/manifest.json', 'runtime.mjs'])) fail('MANIFEST_INVALID');
+  for (const [file, hash] of Object.entries(p.hashes)) if (sha(readFile(path.join(root, file))) !== hash) fail('INSTALLATION_CHANGED');
+  return { manifest: p, policy: policyRead(root) };
+}
+export async function probe(run = spawn, sources = SOURCES) {
+  return Promise.all(sources.map((url, index) => new Promise(resolve => {
+    // -q first ignores curlrc. Explicit fixed proxy, no redirects or noproxy fallback.
+    const child = run('/usr/bin/curl', ['-q', '--silent', '--show-error', '--fail', '--max-time', '10',
+      '--connect-timeout', '6', '--max-filesize', '1024', '--proto', '=https', '--noproxy', '', '--proxy', PROXY, url],
+    { env: cleanEnvironment(), stdio: ['ignore', 'pipe', 'ignore'] });
+    let body = '', settled = false;
+    const finish = matched => { if (!settled) { settled = true; clearTimeout(timer); resolve({ index, matched }); } };
+    const timer = setTimeout(() => { child.kill('SIGKILL'); finish(false); }, 12000);
+    child.stdout?.on('data', d => { body += d; if (body.length > 2048) { child.kill('SIGKILL'); finish(false); } });
+    child.on('error', () => finish(false)); child.on('close', code => finish(code === 0 && body.trim() === EXPECTED_IP));
+  })));
+}
+export function browserReceipt(value, launchId, now = new Date().toISOString()) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(['exitMatches', 'privacyExtensionVerified', 'rtcHostCandidateSeen']) ||
+      !Array.isArray(value.exitMatches) || value.exitMatches.length !== 2 || value.exitMatches.some(x => typeof x !== 'boolean') ||
+      typeof value.privacyExtensionVerified !== 'boolean' ||
+      ![true, false, null].includes(value.rtcHostCandidateSeen)) fail('INVALID_BROWSER_RECEIPT');
+  return { format: FORMAT, checkedAt: now, uid: @@MAIN_UID@@, launchId, source: 'local_start_page_browser_report',
+    exitMatches: value.exitMatches, httpExitMatched: value.exitMatches.every(Boolean),
+    privacyExtensionVerified: value.privacyExtensionVerified,
+    rtcHostCandidateSeen: value.rtcHostCandidateSeen,
+    webRtcUdpVerified: false, failureBehaviorVerified: false, desktopAuthenticationVerified: false,
+    credentialMigrationPerformed: false, systemIsolation: false };
+}
+export function homeHtml(nonce) {
+  if (!/^[a-f0-9]{48}$/.test(nonce)) fail('INVALID_NONCE');
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Claude 东京浏览器 · 网络验收</title><style nonce="${nonce}">
+body{font:17px/1.7 system-ui;max-width:760px;margin:8vh auto;padding:24px;background:#f7f5f0;color:#242924}
+h1{font-size:30px}section{background:white;padding:24px;border:1px solid #ddd;border-radius:12px;margin:18px 0}
+button{padding:10px 20px;font:inherit;cursor:pointer} .note{color:#725121} pre{white-space:pre-wrap;font:inherit}
+</style><h1>Claude 东京浏览器</h1><p>主账户独立 Chrome · 不使用日常 Chrome 或专属账户的登录资料</p>
+<section><h2>先验证，再登录</h2><pre id="status">正在由这个浏览器核对两处公开出口……</pre>
+<button id="retry">重新检测</button></section>
+<section><h2>当前边界</h2><p>网页代理固定为东京网关，没有配置互联网直连回退。保留本机回调连接；这不是整机防火墙。</p>
+<p class="note">本阶段只验收浏览器 HTTP/HTTPS 出口。WebRTC/UDP、代理中断、Desktop 授权跳转还未全部验收，请先不要登录。</p>
+<p>不复制凭证，不修改设备指纹，不代表一台新 Mac，也不保证避免账户限制。</p></section>
+<section><h2>只在本窗口安装一次防护</h2><p>在这个新窗口地址栏输入 <code>chrome://extensions</code>，开启「开发者模式」，点「加载已解压的扩展程序」。文件选择框按 ⌘⇧G，粘贴下方路径，确认选择。</p>
+<pre>@@BROWSER_ROOT@@/extension</pre><p>扩展名称「Claude 东京浏览器防护」。不读取网站内容、账号或 Cookies；只核对东京代理并限制本实例的 WebRTC。安装后返回本页重新检测。不要在日常 Chrome 安装。</p></section>
+<p>结果只保存检测布尔值和时间，Codex 可以直接读回。不会保存 Cookies、账号、密码、授权链接或网卡地址。</p>
+<script nonce="${nonce}">
+const status = document.getElementById('status'), button = document.getElementById('retry');
+async function rtcCheck(){
+  if(typeof RTCPeerConnection !== 'function') return null;
+  let pc; try { pc = new RTCPeerConnection({iceServers:[]}); pc.createDataChannel('local-probe');
+    let host=false; pc.onicecandidate=e=>{if(e.candidate && e.candidate.type === 'host') host=true;};
+    await pc.setLocalDescription(await pc.createOffer()); await new Promise(r=>setTimeout(r,1800)); return host;
+  } catch{return null;} finally{if(pc) pc.close();}
+}
+async function check(){button.disabled=true; status.textContent='检测中……';
+ const exitMatches=await Promise.all(${JSON.stringify(SOURCES)}.map(async url=>{try{
+  const r=await fetch(url+'?tokyo_check='+Date.now(),{cache:'no-store',credentials:'omit',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(12000)});
+  return r.ok && (await r.text()).trim()===${JSON.stringify(EXPECTED_IP)};
+ }catch{return false;}}));
+ document.dispatchEvent(new Event('@@SERVICE_USER@@-privacy-check'));
+ await new Promise(r=>setTimeout(r,1200));
+ const privacyExtensionVerified=document.documentElement.dataset.tokyoPrivacy==='verified';
+ const rtcHostCandidateSeen=await rtcCheck();
+ try {const response=await fetch('result',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({exitMatches,rtcHostCandidateSeen,privacyExtensionVerified}),signal:AbortSignal.timeout(3000)});
+  if(!response.ok) throw Error();
+  status.textContent=(exitMatches.every(Boolean)?'两处网页出口匹配预期东京住宅。':'出口检测未通过：可能是网关断开、出口不符或网页跨域限制。不要登录。')+(privacyExtensionVerified?'\\n专用扩展的有效 WebRTC 策略已核对。':'\\n专用防护扩展还未生效，请完成下方一次性设置。')+'\\n脱敏结果已保存，可返回 Codex。\\n仍需 Codex 核对后续故障及 Desktop 授权跳转。';
+ } catch{status.textContent='测试窗口已过期或结果保存失败。请重新双击东京浏览器入口，不要登录。';}
+ button.disabled=false;
+}
+button.onclick=check;check();</script></html>`;
+}
+export function makeServer(nonce, save) {
+  const page = homeHtml(nonce); let origin;
+  const server = http.createServer((req, res) => {
+    const headers = { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self' https://api.ipify.org https://icanhazip.com; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` };
+    const reply = (code, body, type = 'text/plain; charset=utf-8') => { res.writeHead(code, { ...headers, 'Content-Type': type }); res.end(body); };
+    if (req.headers.host !== origin?.slice(7) || req.socket.remoteAddress !== '127.0.0.1') return reply(403, 'Forbidden');
+    if (req.method === 'GET' && req.url === `/${nonce}/`) return reply(200, page, 'text/html; charset=utf-8');
+    if (req.method !== 'POST' || req.url !== `/${nonce}/result` || req.headers.origin !== origin ||
+        req.headers['content-type'] !== 'application/json') return reply(403, 'Forbidden');
+    let body = ''; req.setTimeout(5000, () => req.destroy());
+    req.on('data', d => { body += d; if (body.length > 512) req.destroy(); });
+    req.on('end', () => { try { save(browserReceipt(JSON.parse(body), nonce)); reply(200, 'Saved'); }
+      catch { reply(400, 'Invalid result'); } });
+  });
+  server.headersTimeout = 5000; server.requestTimeout = 7000;
+  return { server, ready: new Promise(resolve => server.listen(0, '127.0.0.1', () => {
+    origin = `http://127.0.0.1:${server.address().port}`; resolve(`${origin}/${nonce}/`);
+  })) };
+}
+function saveReceipt(file, value) {
+  const temp = path.join(ROOT, `.receipt-${crypto.randomUUID()}.tmp`);
+  fs.writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  noLinks(file); fs.renameSync(temp, file);
+}
+export function checkExistingBrowser(run = spawnSync) {
+  const result = run('/bin/ps', ['-axo', 'uid=,pid=,comm='], { encoding: 'utf8', timeout: 4000, maxBuffer: 1048576 });
+  if (result.status !== 0) fail('PROCESS_CHECK_FAILED');
+  for (const line of result.stdout.split('\n')) {
+    const m = /^\s*@@MAIN_UID@@\s+(\d+)\s+(.+?)\s*$/.exec(line);
+    if (!m || m[2] !== CHROME) continue;
+    const r = run('/bin/ps', ['-p', m[1], '-o', 'command='], { encoding: 'utf8', timeout: 1500, maxBuffer: 65536 });
+    if (r.status !== 0) fail('PROCESS_CHECK_FAILED');
+    // Compare command metadata only; never output or persist command lines/URLs.
+    if (r.stdout.includes(DATA)) fail('CLOSE_TOKYO_BROWSER_FIRST');
+  }
+}
+export async function preflight() {
+  const { policy } = installed();
+  const checks = await probe();
+  const report = { format: FORMAT, at: new Date().toISOString(), uid: @@MAIN_UID@@, proxy: PROXY,
+    policySnapshot: policy.snapshotHash, checks, gatewayPassed: checks.length === 2 && checks.every(x => x.matched),
+    browserVerified: false, webRtcUdpVerified: false, desktopAuthenticationVerified: false };
+  saveReceipt(path.join(ROOT, 'last-preflight.json'), report); return report;
+}
+export async function launch() {
+  mainOnly(); checkExistingBrowser();
+  const report = await preflight(); if (!report.gatewayPassed) fail('GATEWAY_NOT_VERIFIED');
+  if (fs.statSync('/dev/console').uid !== @@MAIN_UID@@) fail('MAIN_DESKTOP_REQUIRED');
+  const token = crypto.randomBytes(24).toString('hex');
+  const { server, ready } = makeServer(token, value => saveReceipt(path.join(ROOT, 'last-browser-result.json'), value));
+  server.on('error', () => process.exit(1)); const home = await ready;
+  const child = spawn(CHROME, chromeArgs(home), { env: cleanEnvironment(), stdio: 'ignore', detached: true });
+  try { await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); }); }
+  catch { server.closeAllConnections(); server.close(); fail('CHROME_LAUNCH_FAILED'); }
+  child.unref();
+  // Bounded one-shot acceptance page, NOT a recurring monitor or a proxy server.
+  setTimeout(() => { server.closeAllConnections(); server.close(); }, 20 * 60 * 1000);
+  console.log(JSON.stringify({ launched: true, browserVerified: false, loginReady: false }));
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  try {
+    if (process.argv.length !== 3) fail('ARGUMENTS');
+    if (process.argv[2] === '--check') { const r = await preflight(); console.log(JSON.stringify(r)); if (!r.gatewayPassed) process.exitCode = 1; }
+    else if (process.argv[2] === '--launch') await launch();
+    else fail('ARGUMENTS');
+  } catch (e) { console.error(/^TOKYO_BROWSER_[A-Z_]+$/.test(e.message) ? e.message : 'TOKYO_BROWSER_FAILED_REDACTED'); process.exitCode = 1; }
+}

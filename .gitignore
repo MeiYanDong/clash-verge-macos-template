@@ -1,0 +1,15 @@
+.private/
+dist/
+build/
+output/
+node_modules/
+*.private.*
+*.local.*
+*.log
+.env
+.env.*
+.DS_Store
+__pycache__/
+*.pyc
+*.zip
+*.tar.gz

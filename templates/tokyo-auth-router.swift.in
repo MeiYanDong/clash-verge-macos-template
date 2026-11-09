@@ -1,0 +1,238 @@
+import AppKit
+import AuthenticationServices
+import CryptoKit
+import Darwin
+
+let root = URL(fileURLWithPath: "@@LOGIN_ROOT@@", isDirectory: true)
+let ownID = "local.clashtokyo.template.login"
+let appPath = "@@LOGIN_APP@@"
+let fm = FileManager.default
+let schemes = ["https", "http"]
+
+struct SavedHandler: Codable { let path: String; let bundleID: String }
+struct LoginState: Codable {
+    var phase: String
+    let sessionID: String
+    let previous: [String: SavedHandler]
+    let expiresAt: Date
+}
+func privateData(_ file: URL) throws -> Data {
+    let attrs = try fm.attributesOfItem(atPath: file.path)
+    guard attrs[.type] as? FileAttributeType == .typeRegular,
+          (attrs[.ownerAccountID] as? NSNumber)?.intValue == @@MAIN_UID@@,
+          ((attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0) & 0o022 == 0,
+          (attrs[.size] as? NSNumber)?.intValue ?? Int.max < 1048576 else { throw NSError(domain: "UnsafeFile", code: 1) }
+    return try Data(contentsOf: file)
+}
+func saveJSON<T: Encodable>(_ value: T, _ name: String) throws {
+    let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601; enc.outputFormatting = [.sortedKeys]
+    let file = root.appendingPathComponent(name)
+    try enc.encode(value).write(to: file, options: .atomic)
+    try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+}
+func loadState() -> LoginState? {
+    let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+    return try? decoder.decode(LoginState.self, from: privateData(root.appendingPathComponent("state.json")))
+}
+func currentHandler(_ scheme: String) -> SavedHandler? {
+    guard let url = NSWorkspace.shared.urlForApplication(toOpen: URL(string: scheme + "://example.invalid/")!),
+          let id = Bundle(url: url)?.bundleIdentifier else { return nil }
+    return SavedHandler(path: url.path, bundleID: id)
+}
+func hash(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+func verifyWorker() throws {
+    let manifest = try JSONSerialization.jsonObject(with: privateData(root.appendingPathComponent("manifest.json"))) as! [String: Any]
+    let paths = manifest["hashes"] as! [String: String]
+    let required = [root.appendingPathComponent("runtime.mjs").path,
+                    "@@BROWSER_ROOT@@/runtime.mjs",
+                    appPath + "/Contents/MacOS/router"]
+    guard Set(paths.keys) == Set(required) else { throw NSError(domain: "ManifestInvalid", code: 1) }
+    for file in required {
+        guard hash(try privateData(URL(fileURLWithPath: file))) == paths[file] else { throw NSError(domain: "InstallationChanged", code: 1) }
+    }
+}
+func event(_ name: String) {
+    // Never record authorization URL, callback URL, cookies or request contents.
+    let obj = ["event": name, "at": ISO8601DateFormatter().string(from: Date())]
+    try? saveJSON(obj, "last-event.json")
+    if name == "SYSTEM_AUTH_REFUSED_LOCALLY" { try? saveJSON(obj, "last-system-auth.json") }
+}
+
+final class LoginApp: NSObject, NSApplicationDelegate, ASWebAuthenticationSessionWebBrowserSessionHandling {
+    var window: NSWindow!
+    var label: NSTextField!
+    var item: NSStatusItem!
+    var state: LoginState?
+    var busy = false
+    var finishing = false
+    var canTerminate = false
+    var timer: Timer?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        ASWebAuthenticationSessionWebBrowserSessionManager.shared.sessionHandler = self
+        makeWindow()
+        state = loadState()
+        if let saved = state, saved.phase != "closed" {
+            // A crash/relaunch never implicitly reopens a pending authorization.
+            state?.phase = "paused"; try? saveJSON(state!, "state.json")
+            show("上次登录模式未正常结束。授权链接已停止接收，请先恢复默认浏览器，再重新开启。")
+        } else if CommandLine.arguments.contains("--activate") {
+            activate()
+        } else {
+            show("点击「开启登录模式」后检查东京出口，再临时接管网页链接。")
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.state?.phase == "armed", let end = self.state?.expiresAt, Date() >= end {
+                self.state?.phase = "expired"; try? saveJSON(self.state!, "state.json")
+                self.show("登录模式已超时，后续链接已拦截。请先取消未完成的登录，再点「结束并恢复浏览器」。")
+                event("SESSION_EXPIRED_CLOSED")
+            }
+        }
+    }
+    func makeWindow() {
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 510, height: 245), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "Claude 登录模式"; window.isReleasedWhenClosed = false; window.center()
+        let view = NSView(frame: window.contentView!.bounds)
+        label = NSTextField(wrappingLabelWithString: "正在检查……")
+        label.frame = NSRect(x: 24, y: 110, width: 462, height: 108); label.font = .systemFont(ofSize: 14)
+        view.addSubview(label)
+        let start = NSButton(title: "开启登录模式", target: self, action: #selector(startClicked)); start.frame = NSRect(x: 20, y: 62, width: 150, height: 34); view.addSubview(start)
+        let end = NSButton(title: "结束并恢复浏览器", target: self, action: #selector(finishClicked)); end.frame = NSRect(x: 270, y: 62, width: 215, height: 34); view.addSubview(end)
+        let note = NSTextField(wrappingLabelWithString: "仅接管新打开的 HTTPS 链接。账号、密码和验证码仍由你在东京 Chrome 内填写。")
+        note.frame = NSRect(x: 24, y: 12, width: 462, height: 40); note.font = .systemFont(ofSize: 12); note.textColor = .secondaryLabelColor; view.addSubview(note)
+        window.contentView = view
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.title = "Claude 登录"
+        let menu = NSMenu()
+        menu.addItem(withTitle: "查看登录模式", action: #selector(reveal), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "结束并恢复浏览器", action: #selector(finishClicked), keyEquivalent: "").target = self
+        item.menu = menu
+        reveal()
+    }
+    @objc func reveal() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+    func show(_ message: String) { label.stringValue = message }
+    @objc func startClicked() { activate() }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { reveal(); return true }
+
+    func worker(_ request: [String: String], _ completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global().async {
+            var passed = false
+            do {
+                try verifyWorker()
+                let child = Process(); child.executableURL = URL(fileURLWithPath: "@@SYSTEM_ROOT@@/bin/node")
+                child.arguments = [root.appendingPathComponent("runtime.mjs").path]
+                child.environment = ["HOME": "@@HOME@@", "USER": "@@USER@@", "LOGNAME": "@@USER@@", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8", "TMPDIR": NSTemporaryDirectory()]
+                let input = Pipe(), output = Pipe(); child.standardInput = input; child.standardOutput = output; child.standardError = FileHandle.nullDevice
+                try child.run()
+                let watchdog = DispatchWorkItem { if child.isRunning { child.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 45, execute: watchdog)
+                input.fileHandleForWriting.write(try JSONSerialization.data(withJSONObject: request)); try input.fileHandleForWriting.close()
+                let data = output.fileHandleForReading.readDataToEndOfFile(); child.waitUntilExit(); watchdog.cancel()
+                if data.count < 8192, let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    passed = child.terminationStatus == 0 && result["ok"] as? Bool == true
+                    if let resultEvent = result["event"] as? String, resultEvent.range(of: "^[A-Z_]+$", options: .regularExpression) != nil { event(resultEvent) }
+                }
+            } catch { event("LOCAL_INTEGRITY_OR_WORKER_FAILED") }
+            DispatchQueue.main.async { completion(passed) }
+        }
+    }
+
+    func activate() {
+        guard !busy, !finishing else { return }
+        guard state == nil || state?.phase == "closed" else { reveal(); return }
+        guard let https = currentHandler("https"), let http = currentHandler("http"),
+              https.bundleID != ownID, http.bundleID != ownID else {
+            show("无法确定原默认浏览器。保持拦截，请在系统设置中恢复默认 Chrome。"); return
+        }
+        busy = true; show("正在核验东京出口、专用 Chrome 和防护扩展。检查通过前不要点击 Claude 登录。")
+        worker(["op": "prepare"]) { okay in
+            self.busy = false
+            guard okay else { self.show("东京浏览器检查未通过，未更改默认浏览器。请运行模板的 doctor 命令检查。"); return }
+            guard currentHandler("https")?.bundleID == https.bundleID, currentHandler("http")?.bundleID == http.bundleID else {
+                self.show("检查期间默认浏览器已改变，未接管。"); return
+            }
+            self.state = LoginState(phase: "preparing", sessionID: UUID().uuidString, previous: ["https": https, "http": http], expiresAt: Date().addingTimeInterval(15 * 60))
+            do { try saveJSON(self.state!, "state.json") } catch { self.show("无法保存恢复记录，未接管。"); self.state = nil; return }
+            self.busy = true; self.show("正在接管系统网页链接。如 macOS 询问，请选择「Claude 登录模式」。")
+            self.setHandlers(0, restoring: false) { okay in
+                self.busy = false
+                if okay && schemes.allSatisfy({ currentHandler($0)?.bundleID == ownID }) {
+                    self.state?.phase = "armed"
+                    do { try saveJSON(self.state!, "state.json") } catch { self.finish(); return }
+                    self.show("登录模式已开启。新的 HTTPS 链接先核验再进入东京 Chrome。完成登录后点「结束并恢复浏览器」。有效期 15 分钟。")
+                    event("LOGIN_MODE_ARMED")
+                } else { self.finish() }
+            }
+        }
+    }
+    func setHandlers(_ index: Int, restoring: Bool, done: @escaping (Bool) -> Void) {
+        if index == schemes.count { done(true); return }
+        let scheme = schemes[index]
+        if restoring && currentHandler(scheme)?.bundleID != ownID { setHandlers(index + 1, restoring: true, done: done); return }
+        guard let previous = state?.previous[scheme] else { done(false); return }
+        let target = URL(fileURLWithPath: restoring ? previous.path : appPath)
+        guard Bundle(url: target)?.bundleIdentifier == (restoring ? previous.bundleID : ownID) else { done(false); return }
+        NSWorkspace.shared.setDefaultApplication(at: target, toOpenURLsWithScheme: scheme) { error in
+            DispatchQueue.main.async {
+                if error != nil { done(false) }
+                else { self.setHandlers(index + 1, restoring: restoring, done: done) }
+            }
+        }
+    }
+    @objc func finishClicked() { finish() }
+    func finish() {
+        guard !finishing else { return }
+        if busy { show("检查或接管正在进行。请稍候再结束，避免切换过程中打开授权页。"); return }
+        guard state != nil, state?.phase != "closed" else { canTerminate = true; NSApp.terminate(nil); return }
+        finishing = true; state?.phase = "ending"
+        do { try saveJSON(state!, "state.json") } catch { finishing = false; show("恢复记录写入失败，保持接管。"); return }
+        show("正在恢复原默认浏览器……")
+        setHandlers(0, restoring: true) { okay in
+            self.finishing = false
+            guard okay, schemes.allSatisfy({ currentHandler($0)?.bundleID != ownID }) else {
+                self.show("默认浏览器恢复未完成，请再次点「结束并恢复浏览器」。未转发任何授权链接。"); event("RESTORE_INCOMPLETE"); return
+            }
+            self.state?.phase = "closed"; try? saveJSON(self.state!, "state.json")
+            event("ORIGINAL_BROWSER_RESTORED"); self.canTerminate = true; NSApp.terminate(nil)
+        }
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if canTerminate { return .terminateNow }
+        finish(); return .terminateCancel
+    }
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let state = state, state.phase == "armed", Date() < state.expiresAt,
+              schemes.allSatisfy({ currentHandler($0)?.bundleID == ownID }), !busy, !finishing,
+              urls.count == 1, urls[0].scheme == "https" else {
+            event("LINK_REFUSED_MODE_NOT_READY"); if label != nil { show("这次链接未打开：登录模式未就绪、正在处理其他链接，或链接不是 HTTPS。请重试原登录按钮。"); reveal() }; return
+        }
+        busy = true; show("收到链接，正在重新核验东京出口。通过后只在东京 Chrome 打开。")
+        worker(["op": "open", "url": urls[0].absoluteString, "sessionID": state.sessionID]) { okay in
+            self.busy = false
+            self.show(okay ? "链接已交给东京 Chrome。请在那里完成登录，成功后点「结束并恢复浏览器」。" : "链接未打开：东京出口或浏览器校验失败。没有转交日常 Chrome。")
+            if !okay { self.reveal() }
+        }
+    }
+    // Do not permit a WebKit/system authentication window to navigate outside
+    // the controlled Chrome profile. Claude 4.16336.0 falls back to openExternal
+    // for this documented non-cancellation error; that URL returns here.
+    func begin(_ request: ASWebAuthenticationSessionRequest!) {
+        event("SYSTEM_AUTH_REFUSED_LOCALLY")
+        request.cancelWithError(NSError(domain: ASWebAuthenticationSessionError.errorDomain, code: ASWebAuthenticationSessionError.presentationContextInvalid.rawValue))
+    }
+    func cancel(_ request: ASWebAuthenticationSessionRequest!) {
+        request.cancelWithError(NSError(domain: ASWebAuthenticationSessionError.errorDomain, code: ASWebAuthenticationSessionError.canceledLogin.rawValue))
+    }
+}
+
+guard getuid() == @@MAIN_UID@@, geteuid() == @@MAIN_UID@@ else { exit(1) }
+if CommandLine.arguments.contains("--status") {
+    let state = loadState()
+    let values: [String: Any] = ["phase": state?.phase ?? "not_started", "https": currentHandler("https")?.bundleID ?? "unknown", "http": currentHandler("http")?.bundleID ?? "unknown"]
+    print(String(data: try JSONSerialization.data(withJSONObject: values, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(0)
+}
+let app = NSApplication.shared
+app.setActivationPolicy(.regular)
+let delegate = LoginApp(); app.delegate = delegate; app.run()

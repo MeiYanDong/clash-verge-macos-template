@@ -1,0 +1,331 @@
+// Read-only menu-bar indicator with a transient card and optional details.
+// No network listener, launch agent,
+// credentials, proxy file reads, arm/lock actions, or configurable command.
+#import <Cocoa/Cocoa.h>
+#include <unistd.h>
+#include <signal.h>
+#include <mach/mach_time.h>
+#include <math.h>
+
+static double Tick(void) {
+  static mach_timebase_info_data_t tb;
+  if (!tb.denom) mach_timebase_info(&tb);
+  return (double)mach_continuous_time() * tb.numer / tb.denom / 1e9;
+}
+static NSDate *ParseTime(id value) {
+  if (![value isKindOfClass:NSString.class]) return nil;
+  NSISO8601DateFormatter *f = [NSISO8601DateFormatter new];
+  f.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+  NSDate *date = [f dateFromString:value];
+  if (!date) { f.formatOptions = NSISO8601DateFormatWithInternetDateTime; date = [f dateFromString:value]; }
+  return date;
+}
+static NSString *LocalTime(id value) {
+  NSDate *date = ParseTime(value); if (!date) return @"暂无有效记录";
+  NSDateFormatter *f = [NSDateFormatter new]; f.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
+  f.timeZone = [NSTimeZone localTimeZone]; f.dateFormat = @"MM/dd HH:mm:ss";
+  return [f stringFromDate:date];
+}
+
+static NSString *Now(void) { return [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]; }
+static NSDictionary *Unknown(void) {
+  return @{ @"state": @"UNKNOWN", @"selectedLane": @"unknown", @"coreRunning": @NO,
+    @"capturedAt": Now(), @"capturedEpoch": @(NSDate.date.timeIntervalSince1970), @"capturedTick": @(Tick()),
+    @"lastExitAt": @"", @"lastOutcome": @"UNKNOWN", @"exitRecordFresh": @NO, @"clashCheck": @"UNKNOWN" };
+}
+static NSDictionary *Redact(id raw) {
+  if (![raw isKindOfClass:NSDictionary.class]) return Unknown();
+  NSDictionary *r = raw;
+  if (![r[@"ok"] isEqual:@YES] || ![r[@"uid"] isEqual:@@@SERVICE_UID@@] ||
+      ![r[@"latch"] isKindOfClass:NSDictionary.class] || ![r[@"coreRunning"] isKindOfClass:NSNumber.class]) return Unknown();
+  NSString *state = r[@"latch"][@"state"], *lane = r[@"selectedLane"];
+  if (![@[@"READY", @"LOCKED", @"VERIFYING", @"CLOSING", @"STOP_UNCONFIRMED", @"STOPPED"] containsObject:state]) return Unknown();
+  BOOL validLane = [@[@"bygcloud", @"nexitally"] containsObject:lane];
+  if ([state isEqual:@"READY"] && (!validLane || ![r[@"coreRunning"] boolValue])) return Unknown();
+  NSString *lastAt = @"", *outcome = @"UNKNOWN";
+  NSArray *probes = [r[@"probes"] isKindOfClass:NSArray.class] ? r[@"probes"] : @[];
+  id last = probes.lastObject;
+  NSDate *date = nil;
+  if ([last isKindOfClass:NSDictionary.class] && [last[@"at"] isKindOfClass:NSString.class] &&
+      [@[@"VERIFIED", @"UNAVAILABLE", @"EXIT_MISMATCH"] containsObject:last[@"outcome"]] &&
+      [last[@"lane"] isEqual:lane]) {
+    date = ParseTime(last[@"at"]);
+    if (date) { lastAt = last[@"at"]; outcome = last[@"outcome"]; }
+  }
+  NSTimeInterval age = date ? -date.timeIntervalSinceNow : INFINITY;
+  NSString *clashCheck = [@[@"VERIFIED", @"UNKNOWN", @"MODE_MISMATCH", @"ROUTING_CHANGED"] containsObject:r[@"clashCheck"] ?: @""] ? r[@"clashCheck"] : @"UNKNOWN";
+  return @{ @"state": state, @"selectedLane": validLane ? lane : @"unknown", @"coreRunning": r[@"coreRunning"],
+    @"capturedAt": Now(), @"capturedEpoch": @(NSDate.date.timeIntervalSince1970), @"capturedTick": @(Tick()),
+    @"lastExitAt": lastAt, @"lastOutcome": outcome,
+    @"exitRecordFresh": @([outcome isEqual:@"VERIFIED"] && age >= 0 && age <= 60), @"clashCheck": clashCheck };
+}
+static NSDictionary *Indicator(NSDictionary *r, double now, double tick) {
+  NSString *color = @"gray", *title = @"等待确认 · 先别打开 Claude", *reason = @"无法读取网关状态，暂不能确认网络可用";
+  double wallAge = now - [r[@"capturedEpoch"] doubleValue], elapsed = tick - [r[@"capturedTick"] doubleValue];
+  BOOL fresh = r && isfinite(wallAge) && isfinite(elapsed) && wallAge >= 0 && elapsed >= 0 && wallAge <= 15 && elapsed <= 15 && fabs(wallAge - elapsed) <= 2;
+  NSString *state = r[@"state"], *outcome = r[@"lastOutcome"];
+  NSDate *date = ParseTime(r[@"lastExitAt"]); double age = date ? now - date.timeIntervalSince1970 : INFINITY;
+  if (!fresh) reason = @"状态读取已过期或尚未完成，请等待新结果";
+  else if ([state isEqual:@"VERIFYING"]) reason = @"东京网关正在核验，请稍候";
+  else if ([@[@"LOCKED", @"STOPPED", @"STOP_UNCONFIRMED", @"CLOSING"] containsObject:state]) {
+    color = @"red"; title = @"暂勿使用 Claude";
+    reason = [state isEqual:@"LOCKED"] ? @"东京网关已锁定；本窗口不会自动解锁" : @"东京网关未处于可用状态";
+  } else if (![r[@"clashCheck"] isEqual:@"VERIFIED"]) {
+    reason = [r[@"clashCheck"] isEqual:@"MODE_MISMATCH"] ? @"Clash 未启用已验收的规则 / TUN 模式" :
+      [r[@"clashCheck"] isEqual:@"ROUTING_CHANGED"] ? @"Clash 分流已变更，需复核后再使用" : @"无法确认主 Clash 状态，请保持 Clash 运行";
+  } else if ([state isEqual:@"READY"]) {
+    if (!isfinite(age) || age < 0 || age > 60) reason = @"住宅出口检查缺失或已过期，暂不能确认";
+    else if ([outcome isEqual:@"VERIFIED"]) {
+      color = @"green"; title = @"可以打开 Claude";
+      reason = @"Clash 分流正常 · 东京网关就绪 · 住宅出口匹配";
+    } else if ([outcome isEqual:@"UNAVAILABLE"] || [outcome isEqual:@"EXIT_MISMATCH"]) {
+      color = @"red"; title = @"暂勿使用 Claude";
+      reason = [outcome isEqual:@"EXIT_MISMATCH"] ? @"最近检查发现出口 IP 不匹配" : @"最近检查发现东京链路不可用";
+    }
+  }
+  return @{ @"color": color, @"title": title, @"reason": reason, @"snapshotFresh": @(fresh) };
+}
+static NSColor *LightColor(NSString *color) {
+  return [color isEqual:@"green"] ? [NSColor colorWithSRGBRed:0.10 green:0.48 blue:0.27 alpha:1] :
+    [color isEqual:@"red"] ? [NSColor colorWithSRGBRed:0.76 green:0.16 blue:0.19 alpha:1] : NSColor.secondaryLabelColor;
+}
+static NSDictionary *ReadStatus(void) {
+  if (getuid() != @@MAIN_UID@@ || geteuid() != @@MAIN_UID@@) return Unknown();
+  NSTask *task = [NSTask new]; task.executableURL = [NSURL fileURLWithPath:@"@@SYSTEM_ROOT@@/bin/node"];
+  task.arguments = @[@"@@STATUS_APP@@/Contents/Resources/tokyo-status-input.mjs"];
+  task.environment = @{ @"PATH": @"/usr/bin:/bin:/usr/sbin:/sbin", @"LANG": @"C" };
+  task.standardInput = NSFileHandle.fileHandleWithNullDevice;
+  task.standardError = NSFileHandle.fileHandleWithNullDevice;
+  NSPipe *pipe = [NSPipe pipe]; task.standardOutput = pipe;
+  NSError *error = nil;
+  if (![task launchAndReturnError:&error]) return Unknown();
+  double deadline = Tick() + 8;
+  while (task.running && Tick() < deadline) usleep(50000);
+  if (task.running) { kill(task.processIdentifier, SIGKILL); return Unknown(); }
+  if (task.terminationStatus != 0) return Unknown();
+  NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+  if (data.length > 32768) return Unknown();
+  return Redact([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+}
+static NSTextField *Label(NSView *parent, CGFloat y, CGFloat height, CGFloat size, NSString *text) {
+  NSTextField *field = [NSTextField wrappingLabelWithString:text];
+  field.frame = NSMakeRect(30, y, 690, height); field.font = [NSFont systemFontOfSize:size];
+  field.selectable = YES; [parent addSubview:field]; return field;
+}
+static NSTextField *CardLabel(NSView *parent, NSRect frame, CGFloat size, NSString *text) {
+  NSTextField *field = Label(parent, frame.origin.y, frame.size.height, size, text);
+  field.frame = frame; return field;
+}
+@interface TokyoStatusDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@property NSWindow *window;
+@property NSTextField *stateLabel, *routeLabel, *probeLabel, *timeLabel, *lampLabel, *reasonLabel;
+@property NSButton *refreshButton;
+@property NSTimer *timer;
+@property BOOL busy;
+@property NSDictionary *snapshot;
+@property NSStatusItem *statusItem;
+@property double lastRequest;
+@property NSUInteger generation;
+@property NSString *demo;
+@property NSPopover *popover;
+@property NSTextField *cardLamp, *cardTitle, *cardReason, *cardRoute, *cardProbe, *cardTime;
+@property NSButton *cardRefresh;
+@end
+@implementation TokyoStatusDelegate
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+  self.demo = [NSBundle.mainBundle objectForInfoDictionaryKey:@"TokyoStatusDemo"];
+  if (![@[@"red", @"gray", @"expiry"] containsObject:self.demo ?: @""]) self.demo = nil;
+  self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 760, 490)
+    styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable
+    backing:NSBackingStoreBuffered defer:NO];
+  self.window.title = self.demo ? @"演示 · 不代表真实网络状态" : @"Claude 东京状态 · 网络指示灯"; self.window.delegate = self;
+  self.window.releasedWhenClosed = NO;
+  NSView *v = self.window.contentView;
+  Label(v, 437, 30, 19, self.demo ? @"界面演示 / 不读取真实网络" : @"CLAUDE  /  东京专线");
+  NSBox *panel = [[NSBox alloc] initWithFrame:NSMakeRect(25, 265, 710, 157)];
+  panel.boxType = NSBoxCustom; panel.borderWidth = 0; panel.fillColor = NSColor.controlBackgroundColor;
+  panel.cornerRadius = 16; [v addSubview:panel];
+  self.lampLabel = Label(v, 313, 94, 78, @"●"); self.lampLabel.frame = NSMakeRect(48, 306, 96, 96);
+  self.lampLabel.selectable = NO;
+  self.stateLabel = Label(v, 345, 43, 28, @"等待确认 · 先别打开 Claude"); self.stateLabel.frame = NSMakeRect(155, 344, 565, 45);
+  self.stateLabel.font = [NSFont systemFontOfSize:28 weight:NSFontWeightSemibold];
+  self.reasonLabel = Label(v, 285, 44, 15, @"正在读取东京专线状态"); self.reasonLabel.frame = NSMakeRect(157, 288, 550, 45);
+  self.routeLabel = Label(v, 217, 31, 17, @"中转链路：读取中");
+  self.probeLabel = Label(v, 173, 37, 14, @"最近住宅检查：读取中");
+  self.timeLabel = Label(v, 137, 31, 13, @"状态读取时间：—"); self.timeLabel.textColor = NSColor.secondaryLabelColor;
+  NSTextField *note = Label(v, 67, 67, 12, @"绿灯：近期网络检查通过　红灯：已确认不可用　灰灯：尚未确认或结果过期\n每 5 秒只读刷新；状态超过 15 秒或出口检查超过 60 秒，不再亮绿灯。\n关闭详情后菜单栏继续检查；仅提示网络状态，不控制 Claude，也不保证账号安全。");
+  note.textColor = NSColor.secondaryLabelColor;
+  self.refreshButton = [NSButton buttonWithTitle:@"立即读取状态" target:self action:@selector(refresh:)];
+  self.refreshButton.frame = NSMakeRect(28, 23, 140, 32); [v addSubview:self.refreshButton];
+  NSButton *quit = [NSButton buttonWithTitle:@"退出状态灯" target:self action:@selector(quit:)];
+  quit.frame = NSMakeRect(590, 23, 140, 32); [v addSubview:quit];
+  self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+  self.statusItem.button.target = self; self.statusItem.button.action = @selector(togglePopover:);
+  [self.window center];
+  [self buildPopover];
+  NSMenu *mainMenu = [NSMenu new], *appMenu = [NSMenu new];
+  NSMenuItem *appItem = [NSMenuItem new]; appItem.submenu = appMenu; [mainMenu addItem:appItem];
+  NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"退出 Claude 状态灯" action:@selector(quit:) keyEquivalent:@"q"];
+  quitItem.target = self; [appMenu addItem:quitItem]; NSApp.mainMenu = mainMenu;
+  self.timer = [NSTimer timerWithTimeInterval:1 target:self selector:@selector(tick:) userInfo:nil repeats:YES];
+  [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+  [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(invalidateForSleep:) name:NSWorkspaceWillSleepNotification object:nil];
+  [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(woke:) name:NSWorkspaceDidWakeNotification object:nil];
+  [self refresh:nil];
+  [self paint];
+  // Show only the compact card once on explicit launch, never the large window.
+  dispatch_async(dispatch_get_main_queue(), ^{ [self togglePopover:nil]; });
+}
+- (void)buildPopover {
+  NSViewController *controller = [NSViewController new];
+  NSView *v = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 420, 360)]; controller.view = v;
+  NSTextField *heading = CardLabel(v, NSMakeRect(20, 320, 380, 22), 13, self.demo ? @"演示 · 不代表真实网络" : @"CLAUDE  /  东京专线");
+  heading.textColor = NSColor.secondaryLabelColor;
+  self.cardLamp = CardLabel(v, NSMakeRect(20, 265, 48, 54), 43, @"●"); self.cardLamp.selectable = NO;
+  self.cardTitle = CardLabel(v, NSMakeRect(78, 274, 322, 41), 20, @"等待确认");
+  self.cardTitle.font = [NSFont systemFontOfSize:20 weight:NSFontWeightSemibold];
+  self.cardReason = CardLabel(v, NSMakeRect(20, 223, 380, 46), 13, @"正在读取网络状态");
+  NSBox *line = [[NSBox alloc] initWithFrame:NSMakeRect(20, 215, 380, 1)]; line.boxType = NSBoxSeparator; [v addSubview:line];
+  self.cardRoute = CardLabel(v, NSMakeRect(20, 165, 380, 42), 13, @"当前链路：读取中");
+  self.cardProbe = CardLabel(v, NSMakeRect(20, 116, 380, 45), 12, @"住宅检查：读取中");
+  self.cardTime = CardLabel(v, NSMakeRect(20, 87, 380, 25), 11, @"状态读取：—"); self.cardTime.textColor = NSColor.secondaryLabelColor;
+  NSTextField *hint = CardLabel(v, NSMakeRect(20, 57, 380, 24), 10, @"5 秒读取 · 过期转灰 · 收起后继续检查 · 非账号安全保证");
+  hint.textColor = NSColor.secondaryLabelColor;
+  self.cardRefresh = [NSButton buttonWithTitle:@"立即读取" target:self action:@selector(refresh:)];
+  self.cardRefresh.frame = NSMakeRect(17, 17, 116, 30); [v addSubview:self.cardRefresh];
+  NSButton *details = [NSButton buttonWithTitle:@"详情" target:self action:@selector(showWindow:)];
+  details.frame = NSMakeRect(148, 17, 86, 30); [v addSubview:details];
+  NSButton *quit = [NSButton buttonWithTitle:@"退出状态灯" target:self action:@selector(quit:)];
+  quit.frame = NSMakeRect(277, 17, 127, 30); [v addSubview:quit];
+  self.popover = [NSPopover new]; self.popover.contentViewController = controller;
+  self.popover.contentSize = NSMakeSize(420, 360); self.popover.behavior = NSPopoverBehaviorTransient;
+  self.popover.animates = NO;
+}
+- (void)togglePopover:(id)sender {
+  if (self.popover.shown) { [self.popover performClose:sender]; return; }
+  [self paint];
+  if (!self.busy && Tick() - self.lastRequest >= 5) [self refresh:nil];
+  [NSApp activateIgnoringOtherApps:YES];
+  [self.popover showRelativeToRect:self.statusItem.button.bounds ofView:self.statusItem.button preferredEdge:NSRectEdgeMinY];
+}
+- (void)showWindow:(id)sender { [self.popover performClose:sender]; [self paint]; [self.window makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; }
+- (void)quit:(id)sender { [NSApp terminate:sender]; }
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)visible {
+  if (!self.popover.shown) [self togglePopover:nil]; return NO;
+}
+- (void)applicationDidBecomeActive:(NSNotification *)notification { if (self.window) [self paint]; }
+- (void)invalidateForSleep:(NSNotification *)notification { self.generation++; self.snapshot = nil; self.lastRequest = 0; [self paint]; }
+- (void)woke:(NSNotification *)notification { [self invalidateForSleep:notification]; [self refresh:nil]; }
+- (void)tick:(id)sender {
+  [self paint];
+  if (!self.busy && Tick() - self.lastRequest >= 5) [self refresh:nil];
+}
+- (void)refresh:(id)sender {
+  if (self.busy) return;
+  if (self.demo) {
+    if (!self.snapshot || ![self.demo isEqual:@"expiry"]) {
+      NSDictionary *raw = @{ @"ok": @YES, @"uid": @@@SERVICE_UID@@, @"coreRunning": @YES, @"selectedLane": @"bygcloud", @"clashCheck": @"VERIFIED",
+        @"latch": @{ @"state": [self.demo isEqual:@"red"] ? @"LOCKED" : @"READY" },
+        @"probes": @[@{ @"lane": @"bygcloud", @"outcome": @"VERIFIED", @"at": Now() }] };
+      self.snapshot = [self.demo isEqual:@"gray"] ? Unknown() : Redact(raw);
+    }
+    self.lastRequest = Tick(); [self paint]; return;
+  }
+  self.busy = YES; self.lastRequest = Tick(); self.refreshButton.enabled = NO; self.cardRefresh.enabled = NO;
+  NSUInteger generation = self.generation;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    NSDictionary *r = ReadStatus();
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (generation == self.generation) self.snapshot = r;
+      self.busy = NO; self.refreshButton.enabled = YES; self.cardRefresh.enabled = YES; [self paint];
+    });
+  });
+}
+- (void)paint {
+  NSDictionary *r = self.snapshot, *light = Indicator(r, NSDate.date.timeIntervalSince1970, Tick());
+  NSString *color = light[@"color"], *lane = r[@"selectedLane"];
+  self.lampLabel.textColor = LightColor(color); self.stateLabel.textColor = LightColor(color);
+  self.stateLabel.stringValue = light[@"title"]; self.reasonLabel.stringValue = light[@"reason"];
+  NSString *airport = [lane isEqual:@"bygcloud"] ? @"白月光 · 日本" : [lane isEqual:@"nexitally"] ? @"奶昔 · 日本" : @"未知";
+  self.routeLabel.stringValue = [NSString stringWithFormat:@"%@：%@ → 东京静态住宅", [color isEqual:@"green"] ? @"当前链路" : @"最近记录（不代表可用）", airport];
+  NSString *o = r[@"lastOutcome"], *check = [o isEqual:@"VERIFIED"] ? @"匹配指定住宅 IP" : [o isEqual:@"EXIT_MISMATCH"] ? @"出口 IP 不匹配" : [o isEqual:@"UNAVAILABLE"] ? @"链路检查失败" : @"未确认";
+  NSDate *date = ParseTime(r[@"lastExitAt"]); double age = date ? -date.timeIntervalSinceNow : INFINITY;
+  self.probeLabel.stringValue = [NSString stringWithFormat:@"最近住宅检查：%@　%@%@", check, LocalTime(r[@"lastExitAt"]),
+    isfinite(age) && age >= 0 ? [NSString stringWithFormat:@"（%.0f 秒前）", age] : @""];
+  self.timeLabel.stringValue = [NSString stringWithFormat:@"状态读取：%@ · UTC+8%@", LocalTime(r[@"capturedAt"]), [light[@"snapshotFresh"] boolValue] ? @"" : @" · 未确认 / 已过期"];
+  self.cardLamp.textColor = LightColor(color); self.cardTitle.textColor = LightColor(color);
+  self.cardTitle.stringValue = light[@"title"]; self.cardReason.stringValue = light[@"reason"];
+  self.cardRoute.stringValue = [NSString stringWithFormat:@"%@：%@\n出口：东京静态住宅", [color isEqual:@"green"] ? @"当前中转" : @"最近中转（非可用性证明）", airport];
+  self.cardProbe.stringValue = [NSString stringWithFormat:@"最近住宅检查：%@\n%@%@", check, LocalTime(r[@"lastExitAt"]),
+    isfinite(age) && age >= 0 ? [NSString stringWithFormat:@"（%.0f 秒前）", age] : @""];
+  self.cardTime.stringValue = self.timeLabel.stringValue;
+  self.statusItem.button.image = [NSImage imageWithSize:NSMakeSize(12, 12) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+    [LightColor(color) setFill]; [[NSBezierPath bezierPathWithOvalInRect:NSInsetRect(rect, 1, 1)] fill]; return YES;
+  }];
+  self.statusItem.button.title = self.demo ? @" 演示" : @" Claude"; self.statusItem.button.imagePosition = NSImageLeft;
+  self.statusItem.button.toolTip = [NSString stringWithFormat:@"%@\n%@", light[@"title"], light[@"reason"]];
+  self.statusItem.button.accessibilityLabel = [NSString stringWithFormat:@"Claude 网络状态：%@，点击展开", light[@"title"]];
+}
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return NO; }
+- (void)applicationWillTerminate:(NSNotification *)notification {
+  [self.timer invalidate]; [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self];
+  if (self.statusItem) [NSStatusBar.systemStatusBar removeStatusItem:self.statusItem];
+}
+@end
+int main(int argc, const char *argv[]) {
+  @autoreleasepool {
+    if (argc == 2 && !strcmp(argv[1], "--snapshot")) {
+      NSDictionary *r = ReadStatus(); NSMutableDictionary *out = [r mutableCopy];
+      out[@"indicator"] = Indicator(r, NSDate.date.timeIntervalSince1970, Tick());
+      [out removeObjectForKey:@"capturedEpoch"]; [out removeObjectForKey:@"capturedTick"];
+      NSData *data = [NSJSONSerialization dataWithJSONObject:out options:NSJSONWritingPrettyPrinted error:nil];
+      fwrite(data.bytes, 1, data.length, stdout); fputc('\n', stdout);
+      return [r[@"state"] isEqual:@"UNKNOWN"] ? 1 : 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--self-test")) {
+      NSDictionary *valid = @{ @"ok": @YES, @"uid": @@@SERVICE_UID@@, @"coreRunning": @YES, @"selectedLane": @"bygcloud", @"latch": @{ @"state": @"READY" }, @"probes": @[], @"password": @"DO_NOT_EXPORT" };
+      NSCAssert([Redact(valid)[@"state"] isEqual:@"READY"], @"ready");
+      NSCAssert([Redact(nil)[@"state"] isEqual:@"UNKNOWN"], @"unknown");
+      NSCAssert(![Redact(valid)[@"exitRecordFresh"] boolValue], @"stale");
+      NSCAssert(Redact(valid)[@"password"] == nil, @"redaction");
+      NSMutableDictionary *bad = [valid mutableCopy]; bad[@"coreRunning"] = @NO;
+      NSCAssert([Redact(bad)[@"state"] isEqual:@"UNKNOWN"], @"inconsistent");
+      bad = [valid mutableCopy]; bad[@"selectedLane"] = @"DIRECT";
+      NSCAssert([Redact(bad)[@"state"] isEqual:@"UNKNOWN"], @"invalid lane");
+      double now = 1801800000, tick = 500;
+      NSMutableDictionary *sample = [@{ @"state": @"READY", @"selectedLane": @"bygcloud", @"coreRunning": @YES,
+        @"capturedEpoch": @(now), @"capturedTick": @(tick), @"lastOutcome": @"VERIFIED", @"clashCheck": @"VERIFIED",
+        @"lastExitAt": [[NSISO8601DateFormatter new] stringFromDate:[NSDate dateWithTimeIntervalSince1970:now-10]] } mutableCopy];
+      NSCAssert([Indicator(sample, now, tick)[@"color"] isEqual:@"green"], @"fresh green");
+      for (NSString *s in @[@"UNKNOWN", @"MODE_MISMATCH", @"ROUTING_CHANGED", @""]) {
+        sample[@"clashCheck"] = s; NSCAssert([Indicator(sample, now, tick)[@"color"] isEqual:@"gray"], @"clash prerequisite");
+      }
+      sample[@"clashCheck"] = @"VERIFIED";
+      NSCAssert([Indicator(sample, now+16, tick+16)[@"color"] isEqual:@"gray"], @"stale status");
+      NSCAssert([Indicator(sample, now+1, tick+120)[@"color"] isEqual:@"gray"], @"sleep clock rollback");
+      NSCAssert([Indicator(sample, now-1, tick+1)[@"color"] isEqual:@"gray"], @"clock rollback");
+      NSCAssert([Indicator(sample, now+9, tick+1)[@"color"] isEqual:@"gray"], @"clock jump");
+      NSCAssert([Indicator(nil, now, tick)[@"color"] isEqual:@"gray"], @"initial gray");
+      for (NSString *s in @[@"LOCKED", @"STOPPED", @"STOP_UNCONFIRMED", @"CLOSING"]) {
+        sample[@"state"] = s; NSCAssert([Indicator(sample, now, tick)[@"color"] isEqual:@"red"], @"unavailable red");
+      }
+      sample[@"state"] = @"VERIFYING";
+      NSCAssert([Indicator(sample, now, tick)[@"color"] isEqual:@"gray"], @"verifying gray");
+      sample[@"state"] = @"READY";
+      for (NSString *o in @[@"UNAVAILABLE", @"EXIT_MISMATCH"]) {
+        sample[@"lastOutcome"] = o; NSCAssert([Indicator(sample, now, tick)[@"color"] isEqual:@"red"], @"bad exit red");
+      }
+      sample[@"lastOutcome"] = @"VERIFIED"; sample[@"lastExitAt"] = @"";
+      NSCAssert([Indicator(sample, now, tick)[@"color"] isEqual:@"gray"], @"missing exit gray");
+      sample[@"lastExitAt"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate dateWithTimeIntervalSince1970:now-61]];
+      NSCAssert([Indicator(sample, now, tick)[@"color"] isEqual:@"gray"], @"old exit gray");
+      sample[@"lastExitAt"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate dateWithTimeIntervalSince1970:now+1]];
+      NSCAssert([Indicator(sample, now, tick)[@"color"] isEqual:@"gray"], @"future exit gray");
+      puts("STATUS_VIEW_SELF_TESTS_PASSED 26"); return 0;
+    }
+    if (argc != 1 || getuid() != @@MAIN_UID@@ || geteuid() != @@MAIN_UID@@) return 64;
+    NSApplication *app = [NSApplication sharedApplication]; [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    TokyoStatusDelegate *delegate = [TokyoStatusDelegate new]; app.delegate = delegate; [app run];
+  }
+  return 0;
+}

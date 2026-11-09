@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "demo": true,
+  "edition": "macos",
+  "main": {
+    "port": 7897
+  },
+  "providers": [
+    {
+      "id": "bygcloud",
+      "label": "Primary",
+      "subscriptionUrl": "",
+      "filters": {
+        "us": "USA|美国|🇺🇸",
+        "hk": "Hong Kong|香港|🇭🇰",
+        "jp": "Japan|日本|🇯🇵"
+      },
+      "nodes": [
+        {
+          "name": "USA Primary",
+          "type": "anytls",
+          "server": "us-primary.example.invalid",
+          "port": 443,
+          "password": "EXAMPLE_ONLY",
+          "sni": "edge.example.invalid"
+        },
+        {
+          "name": "Hong Kong Primary",
+          "type": "anytls",
+          "server": "hk-primary.example.invalid",
+          "port": 443,
+          "password": "EXAMPLE_ONLY",
+          "sni": "edge.example.invalid"
+        },
+        {
+          "name": "Japan Primary",
+          "type": "anytls",
+          "server": "jp-primary.example.invalid",
+          "port": 443,
+          "password": "EXAMPLE_ONLY",
+          "sni": "edge.example.invalid"
+        }
+      ]
+    },
+    {
+      "id": "nexitally",
+      "label": "Secondary",
+      "subscriptionUrl": "",
+      "filters": {
+        "us": "USA|美国|🇺🇸",
+        "hk": "Hong Kong|香港|🇭🇰",
+        "jp": "Japan|日本|🇯🇵"
+      },
+      "nodes": [
+        {
+          "name": "USA Secondary",
+          "type": "anytls",
+          "server": "us-secondary.example.invalid",
+          "port": 443,
+          "password": "EXAMPLE_ONLY",
+          "sni": "edge.example.invalid"
+        },
+        {
+          "name": "Hong Kong Secondary",
+          "type": "anytls",
+          "server": "hk-secondary.example.invalid",
+          "port": 443,
+          "password": "EXAMPLE_ONLY",
+          "sni": "edge.example.invalid"
+        },
+        {
+          "name": "Japan Secondary",
+          "type": "anytls",
+          "server": "jp-secondary.example.invalid",
+          "port": 443,
+          "password": "EXAMPLE_ONLY",
+          "sni": "edge.example.invalid"
+        }
+      ]
+    }
+  ],
+  "residential": {
+    "us": {
+      "server": "us-residence.example.invalid",
+      "port": 1080,
+      "username": "EXAMPLE_ONLY",
+      "password": "EXAMPLE_ONLY",
+      "expectedIp": "198.51.100.10"
+    },
+    "tokyo": {
+      "server": "tokyo-residence.example.invalid",
+      "port": 1080,
+      "username": "EXAMPLE_ONLY",
+      "password": "EXAMPLE_ONLY",
+      "expectedIp": "192.0.2.10"
+    }
+  },
+  "tokyo": {
+    "transitNames": {
+      "bygcloud": "Japan Primary",
+      "nexitally": "Japan Secondary"
+    },
+    "ports": {
+      "gate": 44127,
+      "upstream": 44128,
+      "controller": 44129,
+      "bygcloud": 44130,
+      "nexitally": 44131
+    }
+  },
+  "features": {
+    "browser": true,
+    "login": false,
+    "tools": false,
+    "codex": false
+  },
+  "directDomains": [],
+  "extraResidentialDomains": [],
+  "tools": {
+    "sshBlocks": [],
+    "awsBinary": "/opt/homebrew/bin/aws",
+    "codexBinary": "/Applications/Codex.app/Contents/Resources/codex"
+  }
+}

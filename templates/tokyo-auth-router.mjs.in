@@ -1,0 +1,129 @@
+// Credential-free launcher. URLs travel over stdin and are never in receipts.
+// Authentication stays in the existing, explicitly proxied Chrome profile.
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+
+export const ROOT = '@@LOGIN_ROOT@@';
+const BROWSER_ROOT = '@@BROWSER_ROOT@@';
+export const DATA = '@@BROWSER_DATA@@';
+export const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+export const PROXY = 'http://127.0.0.1:@@GATE_PORT@@';
+const fail = code => { throw Error('TOKYO_LOGIN_' + code); };
+
+export function validateRequest(request) {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) fail('REQUEST_INVALID');
+  const keys = Object.keys(request).sort().join(',');
+  if (request.op === 'prepare' && keys === 'op') return request;
+  if (request.op !== 'open' || keys !== 'op,sessionID,url' || !/^[A-Fa-f0-9-]{36}$/.test(request.sessionID || '') || typeof request.url !== 'string' ||
+      request.url.length > 16384 || /[\x00-\x20\x7f]/.test(request.url)) fail('REQUEST_INVALID');
+  let url;
+  try { url = new URL(request.url); } catch { fail('URL_INVALID'); }
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== 'https:' || url.username || url.password || url.port ||
+      !host.includes('.') || host.endsWith('.') || host.endsWith('.local') || host.endsWith('.localhost') ||
+      host === 'localhost' || host.includes(':') || /^[\d.]+$/.test(host)) fail('URL_REFUSED');
+  return request;
+}
+
+// ps output is inspected only in memory. Never emit a command line or auth URL.
+export function classifyChrome(command) {
+  if (!command.startsWith(CHROME + ' ')) return 'other';
+  if (!command.includes('--user-data-dir=' + DATA)) return 'other';
+  if (!command.includes('--user-data-dir=' + DATA + ' ') && !command.endsWith('--user-data-dir=' + DATA)) return 'other';
+  const flags = command.match(/--(?:proxy-server|proxy-bypass-list|proxy-pac-url|no-proxy-server|user-data-dir)(?:=|\s|$)/g) || [];
+  if (flags.length !== 3 || !command.includes('--proxy-server=' + PROXY + ' ') ||
+      !command.includes('--proxy-bypass-list=localhost;127.0.0.1;[::1] ') ||
+      !/(?:^| )--disable-quic(?: |$)/.test(command) || !/(?:^| )--disable-sync(?: |$)/.test(command)) return 'unsafe';
+  return 'tokyo';
+}
+
+export function existingBrowser(run = spawnSync) {
+  const result = run('/bin/ps', ['-axo', 'uid=,pid=,comm='], { encoding: 'utf8', timeout: 4000, maxBuffer: 2 ** 20 });
+  if (result.status !== 0 || result.error) fail('PROCESS_CHECK_FAILED');
+  const pids = [];
+  for (const line of result.stdout.split('\n')) {
+    const m = /^\s*@@MAIN_UID@@\s+(\d+)\s+(.+?)\s*$/.exec(line);
+    if (!m || m[2] !== CHROME) continue;
+    const r = run('/bin/ps', ['-p', m[1], '-o', 'command='], { encoding: 'utf8', timeout: 2000, maxBuffer: 65536 });
+    if (r.status !== 0 || r.error) fail('PROCESS_CHECK_FAILED');
+    const kind = classifyChrome(r.stdout.trim());
+    if (kind === 'unsafe') fail('BROWSER_FLAGS_CHANGED');
+    if (kind === 'tokyo') pids.push(Number(m[1]));
+  }
+  if (pids.length > 1) fail('AMBIGUOUS_BROWSER');
+  return pids[0] ?? null;
+}
+
+async function startChrome(browser, url, diagnosticURL, run = spawn) {
+  const args = browser.chromeArgs(diagnosticURL);
+  args[args.length - 1] = url;
+  const child = run(CHROME, args, { env: browser.cleanEnvironment(), stdio: 'ignore', detached: true });
+  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', () => reject(Error('TOKYO_LOGIN_CHROME_START_FAILED'))); });
+  child.unref();
+}
+
+async function browserProof(browser) {
+  const token = crypto.randomBytes(24).toString('hex');
+  let finish;
+  const report = new Promise(resolve => { finish = resolve; });
+  const { server, ready } = browser.makeServer(token, value => finish(value));
+  const diagnosticURL = await ready;
+  const timeout = setTimeout(() => finish(null), 20000);
+  server.on('error', () => finish(null));
+  try {
+    await startChrome(browser, diagnosticURL, diagnosticURL);
+    const value = await report;
+    if (value?.httpExitMatched !== true || value?.privacyExtensionVerified !== true) fail('BROWSER_PROOF_FAILED');
+    return diagnosticURL;
+  } finally {
+    clearTimeout(timeout); server.closeAllConnections(); server.close();
+  }
+}
+
+// Dependencies make fail-before-navigation behavior directly testable.
+export async function handleRequest(request, deps) {
+  validateRequest(request);
+  await deps.integrity();
+  deps.existing();
+  const checks = await deps.probe();
+  if (checks.length !== 2 || !checks.every(c => c.matched === true)) fail('EXIT_NOT_VERIFIED');
+  const diagnosticURL = await deps.browserProof();
+  const pid = deps.existing();
+  if (!pid) fail('BROWSER_NOT_RUNNING');
+  if (request.op === 'open') { await deps.authorize(request.sessionID); await deps.open(request.url, diagnosticURL); }
+  return { ok: true, event: request.op === 'open' ? 'URL_OPENED_IN_TOKYO' : 'BROWSER_READY', browserPid: pid,
+    exitVerified: true, privacyVerified: true, at: new Date().toISOString() };
+}
+
+export function authorizeState(state, sessionID, now = Date.now()) {
+  if (state?.sessionID !== sessionID || state?.phase !== 'armed' ||
+      !Number.isFinite(Date.parse(state.expiresAt)) || Date.parse(state.expiresAt) <= now) fail('SESSION_NOT_ACTIVE');
+}
+
+function authorize(sessionID) {
+  const file = ROOT + '/state.json';
+  const s = fs.lstatSync(file);
+  if (!s.isFile() || s.isSymbolicLink() || s.uid !== @@MAIN_UID@@ || (s.mode & 0o077) || s.size > 16384) fail('STATE_UNSAFE');
+  authorizeState(JSON.parse(fs.readFileSync(file, 'utf8')), sessionID);
+}
+
+async function main() {
+  let input = '';
+  for await (const chunk of process.stdin) { input += chunk; if (input.length > 32768) fail('REQUEST_TOO_LARGE'); }
+  let request; try { request = JSON.parse(input); } catch { fail('REQUEST_INVALID'); }
+  validateRequest(request);
+  if (process.getuid() !== @@MAIN_UID@@ || process.geteuid() !== @@MAIN_UID@@ || process.env.HOME !== '@@HOME@@' ||
+      fs.statSync('/dev/console').uid !== @@MAIN_UID@@) fail('MAIN_DESKTOP_REQUIRED');
+  const browser = await import(pathToFileURL(BROWSER_ROOT + '/runtime.mjs').href);
+  const result = await handleRequest(request, {
+    integrity: () => browser.installed(), existing: () => existingBrowser(), probe: () => browser.probe(),
+    browserProof: () => browserProof(browser), authorize, open: (url, diagnosticURL) => startChrome(browser, url, diagnosticURL)
+  });
+  console.log(JSON.stringify(result));
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch(e => { console.log(JSON.stringify({ ok: false, event: /^TOKYO_LOGIN_[A-Z_]+$/.test(e.message) ? e.message : 'TOKYO_LOGIN_CHECK_FAILED' })); process.exitCode = 1; });
+}

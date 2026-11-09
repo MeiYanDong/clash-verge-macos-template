@@ -1,0 +1,39 @@
+// No fetch, credentials, cookie API, remote code, or proxy mutation.
+// Refuses to change privacy preferences in a browser whose effective proxy is
+// not already the explicit Tokyo gateway. Thus ordinary Chrome is not a target.
+function call(setting, method, value) {
+  return new Promise((resolve, reject) => setting[method](value, result => {
+    if (chrome.runtime.lastError) reject(Error('SETTING_FAILED')); else resolve(result);
+  }));
+}
+function isTokyoProxy(value) {
+  const p = value?.rules?.singleProxy;
+  const bypass = value?.rules?.bypassList;
+  return value?.mode === 'fixed_servers' && p?.scheme === 'http' && p.host === '127.0.0.1' && p.port === @@GATE_PORT@@ &&
+    Object.keys(value.rules).every(k => ['singleProxy', 'bypassList'].includes(k)) &&
+    (!bypass || bypass.every(v => ['localhost', '127.0.0.1', '[::1]'].includes(v)));
+}
+async function ensurePrivacy() {
+  try {
+    if (!isTokyoProxy((await call(chrome.proxy.settings, 'get', {incognito:false})).value)) return { verified: false };
+    for (const [setting, value] of [
+      [chrome.privacy.network.webRTCIPHandlingPolicy, 'disable_non_proxied_udp'],
+      [chrome.privacy.network.networkPredictionEnabled, false]
+    ]) {
+      const before = await call(setting, 'get', {});
+      if (!['controllable_by_this_extension', 'controlled_by_this_extension'].includes(before.levelOfControl)) return { verified: false };
+      await call(setting, 'set', {value, scope:'regular'});
+      const after = await call(setting, 'get', {});
+      if (after.value !== value || after.levelOfControl !== 'controlled_by_this_extension') return { verified: false };
+    }
+    return { verified: true };
+  } catch { return { verified: false }; }
+}
+chrome.runtime.onInstalled.addListener(() => { void ensurePrivacy(); });
+chrome.runtime.onStartup.addListener(() => { void ensurePrivacy(); });
+chrome.runtime.onMessage.addListener((message, sender, reply) => {
+  if (sender.id !== chrome.runtime.id || message?.kind !== 'CHECK_TOKYO_PRIVACY') return false;
+  let url; try { url = new URL(sender.url); } catch { return false; }
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !/^\/[a-f0-9]{48}\/$/.test(url.pathname)) return false;
+  ensurePrivacy().then(reply); return true;
+});

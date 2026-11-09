@@ -1,0 +1,10 @@
+// Only our nonce-bearing loopback test page; never visits Claude or reads forms.
+if (/^\/[a-f0-9]{48}\/$/.test(location.pathname)) {
+  const check = () => {
+    document.documentElement.dataset.tokyoPrivacy = 'pending';
+    chrome.runtime.sendMessage({kind:'CHECK_TOKYO_PRIVACY'}, result => {
+      document.documentElement.dataset.tokyoPrivacy = !chrome.runtime.lastError && result?.verified === true ? 'verified' : 'unverified';
+    });
+  };
+  document.addEventListener('claude-tokyo-privacy-check', check); check();
+}

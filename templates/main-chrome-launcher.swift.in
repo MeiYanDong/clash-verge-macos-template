@@ -1,0 +1,49 @@
+// Native, user-invoked entry. No browser data or authentication access.
+import AppKit
+import Foundation
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+func message(_ text: String) {
+    app.activate(ignoringOtherApps: true)
+    let alert = NSAlert()
+    alert.messageText = "Claude 东京浏览器"
+    alert.informativeText = text
+    alert.addButton(withTitle: "知道了")
+    alert.runModal()
+}
+guard getuid() == @@MAIN_UID@@, geteuid() == @@MAIN_UID@@ else {
+    message("此入口只允许安装时指定的用户运行。")
+    exit(1)
+}
+let child = Process()
+child.executableURL = URL(fileURLWithPath: "@@SYSTEM_ROOT@@/bin/node")
+child.arguments = ["@@BROWSER_ROOT@@/runtime.mjs", "--launch"]
+let output = Pipe()
+child.standardOutput = output
+child.standardError = output
+var environment: [String: String] = [:]
+for key in ["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "__CF_USER_TEXT_ENCODING"] {
+    environment[key] = ProcessInfo.processInfo.environment[key]
+}
+environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+child.environment = environment
+do {
+    try child.run()
+    let watchdog = DispatchWorkItem { if child.isRunning { child.terminate() } }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 35, execute: watchdog)
+    // Runtime emits its first bounded status line after launch or failure.
+    let data = output.fileHandleForReading.availableData
+    watchdog.cancel()
+    let result = String(data: data, encoding: .utf8) ?? ""
+    if result.contains("\"launched\":true") { exit(0) }
+    if result.contains("CLOSE_TOKYO_BROWSER_FIRST") {
+        message("东京浏览器已在运行。请先关闭它的窗口并完全退出该独立实例，再打开本入口。日常 Chrome 不需要退出。")
+    } else {
+        message("东京出口或本地配置检查未通过，未打开登录页。请运行模板的 doctor 命令查看检查结果。不要改成直连；如需恢复网关，使用原有人工恢复入口。")
+    }
+    exit(1)
+} catch {
+    message("启动失败，未打开登录页。请运行模板的 doctor 命令检查，原有浏览器与 Claude 数据未改动。")
+    exit(1)
+}

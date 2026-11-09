@@ -1,0 +1,70 @@
+// Fixed read-only readiness inputs. No remote requests or controller mutations.
+import fs from 'node:fs';
+import path from 'node:path';
+import http from 'node:http';
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { pathToFileURL } from 'node:url';
+const run = promisify(execFile);
+const socketPath = '@@MAIN_SOCKET@@';
+export const rulesHash = rules => crypto.createHash('sha256').update(JSON.stringify(
+  rules.map(({ type, payload, proxy }) => ({ type, payload, proxy })))).digest('hex');
+// The native view consumes the last record; an alternate speed probe must not
+// hide the still-current lane's real result or invent a new verification time.
+export const selectedProbes = gate => Array.isArray(gate.probes) ? gate.probes
+  .filter(p => p?.lane === gate.selectedLane)
+  .map(p => ({ lane: p.lane, at: p.at, outcome: p.outcome })) : [];
+export function classifyClash(config, rules, proxies, expected) {
+  if (!config || !Array.isArray(rules) || !proxies || !/^[a-f0-9]{64}$/.test(expected || '')) return 'UNKNOWN';
+  if (config.mode !== 'rule' || config.tun?.enable !== true) return 'MODE_MISMATCH';
+  const group = proxies['Claude · 东京静态住宅'], gate = '🗼 Claude 东京专线（受控入口）';
+  if (rulesHash(rules) !== expected || group?.type !== 'Selector' || group.now !== gate ||
+      JSON.stringify(group.all) !== JSON.stringify([gate]) || proxies[gate]?.type !== 'Http') return 'ROUTING_CHANGED';
+  return 'VERIFIED';
+}
+export function mainApi(route) {
+  return new Promise(resolve => {
+    const req = http.request({ socketPath, path: route, method: 'GET' }, res => {
+      // Preserve multibyte characters across network chunk boundaries.
+      const chunks = []; let size = 0, oversized = false;
+      res.on('data', chunk => {
+        size += chunk.length;
+        if (size > 4 * 1024 * 1024) { oversized = true; req.destroy(); resolve(null); }
+        else if (!oversized) chunks.push(chunk);
+      });
+      res.on('aborted', () => resolve(null));
+      res.on('error', () => resolve(null));
+      res.on('end', () => { try {
+        resolve(!oversized && res.statusCode === 200 ? JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))) : null);
+      } catch { resolve(null); } });
+    });
+    req.on('error', () => resolve(null)); req.setTimeout(2000, () => { req.destroy(); resolve(null); }); req.end();
+  });
+}
+export async function readCombinedStatus() {
+  if (process.getuid() !== @@MAIN_UID@@ || process.geteuid() !== @@MAIN_UID@@) return null;
+  let expected;
+  try {
+    const filename = path.join(import.meta.dirname, 'baseline.private.json'), stat = fs.lstatSync(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== @@MAIN_UID@@ || (stat.mode & 0o077)) return null;
+    expected = JSON.parse(fs.readFileSync(filename)).rulesHash;
+  } catch { return null; }
+  const [gate, config, rules, proxy] = await Promise.all([
+    run('/usr/bin/sudo', ['-n', '-k', '-u', '@@SERVICE_USER@@', '--',
+      '@@SYSTEM_ROOT@@/bin/tokyo-gateway-control', 'status'],
+      { timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 32768, env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C' } })
+      .then(r => JSON.parse(r.stdout)).catch(() => null),
+    mainApi('/configs'), mainApi('/rules'), mainApi('/proxies')
+  ]);
+  if (!gate) return null;
+  // Whitelist output; never emit full controller configuration or connections.
+  return { ok: gate.ok, uid: gate.uid, coreRunning: gate.coreRunning,
+    selectedLane: gate.selectedLane, latch: { state: gate.latch?.state },
+    probes: selectedProbes(gate),
+    clashCheck: classifyClash(config, rules?.rules, proxy?.proxies, expected) };
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (process.argv.length !== 2) process.exitCode = 64;
+  else { try { console.log(JSON.stringify(await readCombinedStatus())); } catch { console.log('null'); process.exitCode = 1; } }
+}

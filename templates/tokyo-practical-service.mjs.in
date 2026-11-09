@@ -1,0 +1,73 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import net from 'node:net';
+import { privateJson, TokyoPracticalRuntime } from '../src/tokyo-practical-runtime.mjs';
+import { ownedJson, StartupIntent, StartupPolicy } from '../src/tokyo-startup-policy.mjs';
+import { STARTUP_CONFIG, READINESS_FILE, loadStartupConfig } from '../src/tokyo-login-preflight.mjs';
+
+const [settingsPath, binary, ...extra] = process.argv.slice(2);
+let runtime, control, startup, startupTimer;
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return; shuttingDown = true;
+  clearInterval(startupTimer); startup?.stop();
+  if (control) control.close();
+  const stopped = await runtime?.close();
+  process.exit(stopped === false ? 1 : 0);
+}
+try {
+  if (!path.isAbsolute(settingsPath || '') || !path.isAbsolute(binary || '') || extra.length) throw Error('TOKYO_ARGUMENTS');
+  const settings = privateJson(settingsPath);
+  // Legacy/test packages remain locked unless this separate, root-owned opt-in
+  // exists. The login process only publishes readiness; it cannot clear locks.
+  const startupConfig = path.resolve(settingsPath) === '@@SYSTEM_ROOT@@/private/settings.private.json' &&
+    fs.existsSync(STARTUP_CONFIG) ? loadStartupConfig() : null;
+  const intent = startupConfig ? new StartupIntent(path.join(path.dirname(settingsPath), 'startup-intent.json')) : null;
+  runtime = new TokyoPracticalRuntime({ settings, directory: path.dirname(settingsPath), binary,
+    ...(intent ? { readinessCheck: () => startup.readiness(), onTrip: (reason, meta) => intent.trip(reason, meta),
+      onReady: () => intent.ready() } : {}) });
+  if (intent) startup = new StartupPolicy({ intent, latch: runtime.latch, rulesHash: startupConfig.rulesHash,
+    readReadiness: () => ownedJson(READINESS_FILE, @@MAIN_UID@@) });
+  const snapshot = () => ({ ...runtime.snapshot, ...(startup ? { startup: startup.snapshot } : {}) });
+  await runtime.listen(); // Bind the gate before removing a stale control socket.
+  const socketPath = path.join(path.dirname(settingsPath), 'control.sock');
+  if (fs.existsSync(socketPath)) {
+    const stat = fs.lstatSync(socketPath);
+    if (!stat.isSocket() || stat.uid !== process.getuid()) throw Error('TOKYO_CONTROL_PATH_UNSAFE');
+    fs.unlinkSync(socketPath);
+  }
+  control = net.createServer(socket => {
+    let request = ''; let handled = false;
+    socket.setTimeout(45000, () => socket.destroy()); socket.on('error', () => {});
+    socket.on('data', async data => {
+      if (handled) return;
+      request += data.toString();
+      if (request.length > 1024) { socket.destroy(); return; }
+      if (!request.includes('\n')) return;
+      handled = true;
+      try {
+        const command = JSON.parse(request.trim()).command;
+        if (!['status', 'arm', 'lock'].includes(command)) throw Error('TOKYO_CONTROL_COMMAND');
+        if (command === 'arm') await runtime.latch.armManually();
+        if (command === 'lock') await runtime.latch.trip('MANUAL_LOCK');
+        socket.end(JSON.stringify({ ok: true, ...snapshot() }) + '\n');
+      } catch { socket.end(JSON.stringify({ ok: false, error: 'TOKYO_CONTROL_REJECTED', ...snapshot() }) + '\n'); }
+    });
+  });
+  const originalMask = process.umask(0o177);
+  try {
+    await new Promise((resolve, reject) => {
+      control.once('error', reject); control.listen(socketPath, resolve);
+    });
+    fs.chmodSync(socketPath, 0o600);
+  } finally { process.umask(originalMask); }
+  control.on('error', () => { void shutdown(); });
+  process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
+  const unsafeShutdown = async () => { await runtime.latch.trip('SERVICE_ERROR'); await shutdown(); };
+  process.on('uncaughtException', unsafeShutdown); process.on('unhandledRejection', unsafeShutdown);
+  if (startup) startupTimer = setInterval(() => { void startup.step().catch(() => shutdown()); }, 1000);
+  console.log(JSON.stringify({ event: 'STARTED_LOCKED', scope: 'explicit_proxy_only', uid: process.getuid() }));
+} catch {
+  await runtime?.close();
+  console.error('TOKYO_SERVICE_START_FAILED_DETAILS_REDACTED'); process.exitCode = 1;
+}

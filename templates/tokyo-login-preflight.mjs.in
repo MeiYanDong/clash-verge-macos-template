@@ -1,0 +1,129 @@
+// Read-only main Clash inspection plus a non-secret, short-lived attestation.
+// No arm/lock commands, credentials, Claude launch, or controller writes.
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { pathToFileURL } from 'node:url';
+import { ownedJson, durableJson } from './tokyo-startup-policy.mjs';
+const run = promisify(execFile);
+export const STARTUP_ROOT = '@@SYSTEM_ROOT@@';
+export const STARTUP_CONFIG = STARTUP_ROOT + '/startup-config.json';
+export const READINESS_FILE = '@@READINESS_FILE@@';
+const MAIN_SOCKET = '@@MAIN_SOCKET@@';
+const RENDERED = '@@RENDERED_CONFIG@@';
+export const rulesDigest = rules => crypto.createHash('sha256').update(JSON.stringify(
+  rules.map(({ type, payload, proxy }) => ({ type, payload, proxy })))).digest('hex');
+export function loadStartupConfig() {
+  const c = ownedJson(STARTUP_CONFIG, 0);
+  if (c.version !== 1 || c.enabled !== true || !/^[a-f0-9]{64}$/.test(c.rulesHash || '') || c.readinessFile !== READINESS_FILE)
+    throw Error('STARTUP_CONFIG_INVALID');
+  return c;
+}
+export function classifyMain({ config, rules, proxies, endpoint }, expectedHash) {
+  const group = proxies?.['Claude · 东京静态住宅'], gate = '🗼 Claude 东京专线（受控入口）';
+  // Check every available safety input before classifying an outage. A disabled
+  // TUN or an unavailable controller must not mask a changed rule/exit route.
+  if (config && (config.mode !== 'rule' || typeof config.tun?.enable !== 'boolean')) return 'MISMATCH';
+  if (rules != null && (!Array.isArray(rules) || rulesDigest(rules) !== expectedHash)) return 'MISMATCH';
+  if (proxies && (group?.type !== 'Selector' || group.now !== gate ||
+      JSON.stringify(group.all) !== JSON.stringify([gate]) || proxies[gate]?.type !== 'Http')) return 'MISMATCH';
+  if (endpoint && (endpoint.name !== gate || endpoint.type !== 'http' ||
+      endpoint.server !== '127.0.0.1' || endpoint.port !== @@GATE_PORT@@)) return 'MISMATCH';
+  if (!config || !Array.isArray(rules) || !proxies || !endpoint) return 'WAITING';
+  // WAITING is closed/retryable, never VERIFIED: restoring TUN still requires
+  // fresh bound readiness and two complete residential confirmations.
+  if (config.tun.enable === false) return 'WAITING';
+  return 'VERIFIED';
+}
+export function mainRead(route) {
+  return new Promise(resolve => {
+    const req = http.request({ socketPath: MAIN_SOCKET, path: route, method: 'GET' }, res => {
+      // TCP chunks may split a UTF-8 character. Decode once after assembling
+      // bounded bytes; converting each Buffer separately corrupts rule names.
+      const chunks = []; let size = 0, oversized = false;
+      res.on('data', b => {
+        size += b.length;
+        if (size > 4 * 1024 * 1024) { oversized = true; req.destroy(); resolve(null); }
+        else if (!oversized) chunks.push(b);
+      });
+      res.on('aborted', () => resolve(null));
+      res.on('error', () => resolve(null));
+      res.on('end', () => { try {
+        resolve(!oversized && res.statusCode === 200 ? JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))) : null);
+      } catch { resolve(null); } });
+    });
+    req.setTimeout(2000, () => { req.destroy(); resolve(null); }); req.on('error', () => resolve(null)); req.end();
+  });
+}
+export async function gatewayReadDetailed({ runner = run } = {}) {
+  const diagnostics = [];
+  // Retry only a killed, timed-out read of the fixed local status helper.
+  // No cached identity, old attestation, arm/lock, or unbounded retry is used.
+  for (const timeout of [6000, 1500]) {
+    let result;
+    try {
+      result = await runner('/usr/bin/sudo', ['-n', '-k', '-u', '@@SERVICE_USER@@', '--', STARTUP_ROOT + '/bin/tokyo-gateway-control', 'status'],
+        { encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 32768,
+          env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C' } });
+    } catch (error) {
+      const timedOut = error.killed === true && error.signal === 'SIGKILL' && error.code === null;
+      diagnostics.push(timedOut ? 'TIMEOUT' : 'HELPER_FAILED');
+      if (timedOut && diagnostics.length === 1) continue;
+      return { gate: null, diagnostics };
+    }
+    try {
+      const gate = JSON.parse(result.stdout);
+      if (!gate || gate.ok !== true || gate.uid !== @@SERVICE_UID@@ || !Number.isSafeInteger(gate.pid) || gate.pid < 1 ||
+          !gate.latch || !['LOCKED', 'VERIFYING', 'READY', 'CLOSING', 'STOP_UNCONFIRMED'].includes(gate.latch.state))
+        throw Error('FORMAT');
+      diagnostics.push('VERIFIED');
+      return { gate, diagnostics };
+    } catch {
+      diagnostics.push('INVALID_RESPONSE');
+      return { gate: null, diagnostics };
+    }
+  }
+  return { gate: null, diagnostics };
+}
+export async function gatewayRead() {
+  return (await gatewayReadDetailed()).gate;
+}
+export async function endpointRead() {
+  try {
+    const s = fs.lstatSync(RENDERED); if (!s.isFile() || s.isSymbolicLink() || s.uid !== @@MAIN_UID@@) return null;
+    // Only the credential-free loopback endpoint is emitted, never the rest of
+    // the rendered subscription. No shell expansion or inherited proxy env.
+    const code = 'require "yaml"; require "json"; c=YAML.safe_load(File.read(ARGV.fetch(0)), permitted_classes: [], permitted_symbols: [], aliases: false); p=c.fetch("proxies").select{|x| x["name"]=="🗼 Claude 东京专线（受控入口）"}; STDOUT.write(JSON.generate(p.length==1 ? p.first.slice("name","type","server","port") : {}))';
+    const r = await run('/usr/bin/ruby', ['-e', code, RENDERED], { encoding: 'utf8', timeout: 3000, maxBuffer: 16384 });
+    return JSON.parse(r.stdout);
+  } catch { return null; }
+}
+export async function preflight(config) {
+  const startedAt = new Date().toISOString();
+  const [control, c, r, p, endpoint] = await Promise.all([gatewayReadDetailed(), mainRead('/configs'), mainRead('/rules'), mainRead('/proxies'), endpointRead()]);
+  const gate = control.gate;
+  const mainStatus = classifyMain({ config: c, rules: r?.rules, proxies: p?.proxies, endpoint }, config.rulesHash);
+  const bound = gate?.startup?.enabled === true && /^[a-f0-9]{32}$/.test(gate.startup.challenge || '');
+  const status = mainStatus === 'VERIFIED' && !bound ? 'WAITING' : mainStatus;
+  // A slow status retry must not make older main-route reads look newly taken.
+  return { version: 1, at: startedAt, pid: gate?.pid ?? null, challenge: gate?.startup?.challenge ?? null,
+    status, rulesHash: config.rulesHash, gatewayCheck: control.diagnostics };
+}
+export async function runPreflight() {
+  if (process.getuid() !== @@MAIN_UID@@ || process.geteuid() !== @@MAIN_UID@@) throw Error('STARTUP_MAIN_USER_REQUIRED');
+  const config = loadStartupConfig();
+  const s = fs.lstatSync(path.dirname(READINESS_FILE));
+  if (!s.isDirectory() || s.isSymbolicLink() || s.uid !== @@MAIN_UID@@ || (s.mode & 0o022)) throw Error('STARTUP_MAIN_DIRECTORY_UNSAFE');
+  let stopping = false; for (const name of ['SIGTERM', 'SIGINT']) process.on(name, () => { stopping = true; });
+  while (!stopping) {
+    durableJson(READINESS_FILE, await preflight(config), 0o644);
+    await new Promise(r => setTimeout(r, 3000));
+  }
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (process.argv.length !== 2) process.exitCode = 64;
+  else try { await runPreflight(); } catch { console.error('TOKYO_LOGIN_PREFLIGHT_STOPPED'); process.exitCode = 1; }
+}

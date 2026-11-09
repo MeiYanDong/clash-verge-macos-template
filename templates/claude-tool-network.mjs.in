@@ -1,0 +1,298 @@
+// Application-level routing helpers, NOT an OS sandbox or an inter-user boundary.
+// No credentials are copied here. Only the existing verified Tokyo gate is used.
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { isIP } from 'node:net';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export const FORMAT = 'claude-tool-network-v1';
+export const PROXY = 'http://127.0.0.1:@@GATE_PORT@@';
+export const BYPASS = 'localhost,127.0.0.1,::1';
+export const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
+export const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
+const fail = reason => { throw Error(`CLAUDE_TOOLS_${reason}`); };
+
+export function noSymlinks(file) {
+  for (let p = path.resolve(file); p !== path.dirname(p); p = path.dirname(p)) {
+    try { if (fs.lstatSync(p).isSymbolicLink()) fail('SYMLINK_REFUSED'); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
+}
+export function readOwned(file, uid, max = 1048576) {
+  noSymlinks(file);
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const s = fs.fstatSync(fd);
+    if (!s.isFile() || s.uid !== uid || s.nlink !== 1 || (s.mode & 0o022) || s.size > max) fail('FILE_UNSAFE');
+    return fs.readFileSync(fd, 'utf8');
+  } finally { fs.closeSync(fd); }
+}
+
+export function parseStaticSsh(text) {
+  const blocks = []; let block;
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*([^#\s]+)\s+(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    const key = m[1].toLowerCase(), value = m[2];
+    if (['include', 'match'].includes(key)) fail('DYNAMIC_SSH_REVIEW_REQUIRED');
+    if (key === 'host') {
+      const aliases = value.split(/\s+/);
+      if (aliases.some(h => !/^[a-zA-Z0-9_.-]+$/.test(h))) fail('SSH_HOST_REVIEW_REQUIRED');
+      block = { aliases, options: {} }; blocks.push(block);
+    } else {
+      if (!block || Object.hasOwn(block.options, key)) fail('SSH_OPTIONS_REVIEW_REQUIRED');
+      block.options[key] = value;
+    }
+  }
+  return blocks;
+}
+
+export function renderSsh(blocks, root, home) {
+  const keep = ['hostname', 'user', 'port', 'identityfile', 'identitiesonly', 'hostkeyalias',
+    'serveraliveinterval', 'serveralivecountmax', 'connecttimeout'];
+  const names = new Set();
+  const out = ['# Claude-only routes. Original SSH files are never included or changed.'];
+  for (const { aliases, options } of blocks) {
+    if (aliases.some(n => names.has(n))) fail('DUPLICATE_SSH_HOST');
+    aliases.forEach(n => names.add(n));
+    out.push(`Host ${aliases.join(' ')}`);
+    for (const k of keep) if (options[k] !== undefined) {
+      if (/[\r\n]/.test(options[k])) fail('SSH_VALUE_REVIEW_REQUIRED');
+      out.push(`  ${k} ${options[k]}`);
+    }
+    const jump = options.proxyjump;
+    if (jump && jump !== 'none') {
+      if (!/^(?:[a-zA-Z0-9_.-]+@)?[a-zA-Z0-9_.-]+$/.test(jump)) fail('MULTIHOP_REVIEW_REQUIRED');
+      // Explicitly recurse through OUR wrapper; OpenSSH's implicit jump would
+      // otherwise be able to pick up the original, physical-interface config.
+      out.push(`  ProxyCommand ${quote(path.join(root, 'bin/ssh'))} -W '[%h]:%p' ${jump}`);
+    }
+  }
+  out.push('Host *', '  ProxyCommand /usr/bin/nc -G 10 -X connect -x 127.0.0.1:@@GATE_PORT@@ %h %p',
+    '  ControlMaster no', '  ControlPath none', '  ControlPersist no', '  ForwardAgent no',
+    '  PermitLocalCommand no', '  BatchMode yes', '  StrictHostKeyChecking yes',
+    `  UserKnownHostsFile ${JSON.stringify(path.join(home, '.ssh/known_hosts'))}`, '  UpdateHostKeys no',
+    '  ConnectTimeout 15', '  ServerAliveInterval 30', '  ServerAliveCountMax 3', '');
+  return out.join('\n');
+}
+
+export function routingEnvironment(root) {
+  return { HTTP_PROXY: PROXY, HTTPS_PROXY: PROXY, ALL_PROXY: PROXY,
+    http_proxy: PROXY, https_proxy: PROXY, all_proxy: PROXY, NO_PROXY: BYPASS, no_proxy: BYPASS,
+    GIT_SSH_COMMAND: quote(path.join(root, 'bin/ssh')), GIT_SSH_VARIANT: 'ssh',
+    AWS_EC2_METADATA_DISABLED: 'true' };
+}
+export function childEnvironment(root, original = process.env) {
+  const env = { ...original, ...routingEnvironment(root) };
+  const protocols = original.GIT_ALLOW_PROTOCOL?.split(':') ?? ['http', 'https', 'ssh', 'file'];
+  env.GIT_ALLOW_PROTOCOL = protocols.filter(p => ['http', 'https', 'ssh', 'file'].includes(p)).join(':');
+  env.PATH = `${path.join(root, 'bin')}:${original.PATH ?? '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'}`;
+  return env;
+}
+export function renderEnvironment(root) {
+  return '# Claude Bash tools only; never source this from global shell startup files.\n' +
+    Object.entries(routingEnvironment(root)).map(([k, v]) => `export ${k}=${quote(v)}`).join('\n') +
+    `\nexport PATH=${quote(path.join(root, 'bin'))}:"$PATH"\n`;
+}
+
+export function hookResult(request, root, codexRoute = null) {
+  if (request?.hook_event_name !== 'PreToolUse' || request.tool_name !== 'Bash' ||
+    typeof request.tool_input?.command !== 'string') fail('HOOK_INPUT_INVALID');
+  const prefix = `. ${quote(path.join(root, 'environment.sh'))} || exit 125\n`;
+  const command = codexRoute ? codexRoute.rewriteCodexCommand(request.tool_input.command, root) : request.tool_input.command;
+  return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: {
+    ...request.tool_input,
+    command: command.startsWith(prefix) ? command : prefix + command
+  }, ...(codexRoute ? { additionalContext: `调用 Codex 时使用 ${path.join(root, 'bin/codex')}（已配置美国住宅）。新建脚本、Python/Node 子进程也使用此入口；不要直接执行 App 内二进制。Claude 的其他工具继续使用原东京环境。` } : {}) } }; // Does not auto-approve.
+}
+export function makeSettings(original, root, node) {
+  if (!original || typeof original !== 'object' || Array.isArray(original) ||
+    (original.env && (typeof original.env !== 'object' || Array.isArray(original.env))) ||
+    (original.hooks && (typeof original.hooks !== 'object' || Array.isArray(original.hooks)))) fail('SETTINGS_REVIEW_REQUIRED');
+  const result = structuredClone(original);
+  const env = routingEnvironment(root);
+  // Refuse a conflicting pre-existing proxy; do not silently overwrite personal settings.
+  for (const [k, v] of Object.entries(env)) if (result.env?.[k] !== undefined && result.env[k] !== v) fail('EXISTING_ENV_CONFLICT');
+  result.env = { ...result.env, ...env };
+  const command = `${quote(node)} ${quote(path.join(root, 'runtime.mjs'))} hook`;
+  const hook = { matcher: 'Bash', hooks: [{ type: 'command', command, timeout: 10 }] };
+  result.hooks ??= {};
+  if (result.hooks.PreToolUse && !Array.isArray(result.hooks.PreToolUse)) fail('HOOKS_REVIEW_REQUIRED');
+  result.hooks.PreToolUse ??= [];
+  if (!result.hooks.PreToolUse.some(h => JSON.stringify(h) === JSON.stringify(hook))) result.hooks.PreToolUse.push(hook);
+  return result;
+}
+
+const forbiddenSsh = new Set(['proxycommand', 'proxyjump', 'proxyusefdpass', 'bindaddress', 'bindinterface',
+  'controlmaster', 'controlpath', 'controlpersist', 'localcommand', 'permitlocalcommand', 'knownhostscommand', 'include', 'match']);
+export function configuredSshAliases(text) {
+  return [...text.matchAll(/^Host (.+)$/gm)].flatMap(m => m[1].trim().split(/\s+/)).filter(n => n !== '*');
+}
+export function validateSshDestination(destination, profile) {
+  let host = destination;
+  if (host.startsWith('ssh://')) {
+    try { host = new URL(host).hostname; } catch { fail('SSH_ARGUMENTS'); }
+  } else host = host.slice(host.lastIndexOf('@') + 1);
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+  // An unknown short name is almost always a missing local Host alias. Never
+  // send it to residential DNS and disguise the error as a failed handshake.
+  // Public FQDNs and IP literals retain their existing Tokyo-only route.
+  if (!host.includes('.') && !isIP(host) &&
+    !profile.sshAliases?.some(n => n.toLowerCase() === host.toLowerCase())) fail('SSH_ALIAS_NOT_CONFIGURED');
+}
+export function sshArguments(args, profile) {
+  const out = ['-F', path.join(profile.root, 'ssh_config')];
+  const needValue = new Set(['c', 'E', 'e', 'I', 'i', 'L', 'l', 'm', 'p', 'Q', 'R', 'W', 'w']);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--' || !a.startsWith('-') || a === '-') {
+      const destination = a === '--' ? args[i + 1] : a;
+      if (destination) validateSshDestination(destination, profile);
+      out.push(...args.slice(i)); break;
+    }
+    const flag = a[1];
+    if (['J', 'b', 'B', 'S', 'O'].includes(flag)) fail('SSH_ROUTING_OVERRIDE_REFUSED');
+    if (flag === 'F') {
+      const file = a.slice(2) || args[++i];
+      if (!file || !profile.acceptedSshFiles.includes(path.resolve(file))) fail('SSH_CONFIG_OVERRIDE_REFUSED');
+      continue; // A reviewed project -F is mapped to the equivalent independent aliases.
+    }
+    if (flag === 'o') {
+      const value = a.slice(2) || args[++i];
+      if (!value || forbiddenSsh.has(value.trim().split(/[=\s]/)[0].toLowerCase())) fail('SSH_ROUTING_OVERRIDE_REFUSED');
+      out.push('-o', value); continue;
+    }
+    if (needValue.has(flag)) {
+      out.push(a);
+      if (a.length === 2) { if (args[++i] === undefined) fail('SSH_ARGUMENTS'); out.push(args[i]); }
+      continue;
+    }
+    if (!/^-[1246AaCfGgKkMNnqsTtVvXxYy]+$/.test(a)) fail('SSH_OPTION_REVIEW_REQUIRED');
+    out.push(a);
+  }
+  return out;
+}
+
+export function splitGitArgs(args) {
+  const global = []; let i = 0;
+  const separate = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env']);
+  while (i < args.length && args[i].startsWith('-')) {
+    const a = args[i++]; global.push(a);
+    if (separate.has(a)) { if (args[i] === undefined) fail('GIT_ARGUMENTS'); global.push(args[i++]); }
+    else if (!/^(?:--(?:bare|no-pager|paginate|no-replace-objects|literal-pathspecs|glob-pathspecs|noglob-pathspecs|icase-pathspecs|no-optional-locks)|--(?:git-dir|work-tree|namespace|config-env)=.+|-[Cc].+|-P|-p)$/.test(a)) {
+      if (['--version', '-v', '--help', '-h'].includes(a)) return { global: [], rest: args, diagnostic: true };
+      fail('GIT_OPTION_REVIEW_REQUIRED');
+    }
+  }
+  return { global, rest: args.slice(i), diagnostic: false };
+}
+export function gitInvocation(args, profile, env, run = spawnSync) {
+  const { global, rest, diagnostic } = splitGitArgs(args);
+  if (diagnostic) return args;
+  const probe = run(profile.binaries.git, [...global, 'config', '--name-only', '--get-regexp',
+    '^(http\\..*proxy|remote\\..*\\.proxy)$'], { env, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+  if (![0, 1].includes(probe.status)) fail('GIT_CONFIG_CHECK_FAILED');
+  const keys = new Set(['http.proxy', ...(probe.stdout ?? '').split(/\r?\n/).filter(Boolean)]);
+  if ([...keys].some(k => /[\r\n\0=]/.test(k) || !/^(http\..*proxy|remote\..*\.proxy)$/.test(k))) fail('GIT_PROXY_KEY_INVALID');
+  const override = [...keys].flatMap(k => ['-c', `${k}=${PROXY}`]);
+  return [...global, ...override, '-c', `core.sshCommand=${quote(path.join(profile.root, 'bin/ssh'))}`, ...rest];
+}
+
+export function loadProfile(root) {
+  noSymlinks(root);
+  const uid = process.getuid(), st = fs.lstatSync(root);
+  if (!st.isDirectory() || st.uid !== uid || (st.mode & 0o077)) fail('PROFILE_DIRECTORY_UNSAFE');
+  const p = JSON.parse(readOwned(path.join(root, 'profile.json'), uid));
+  if (p.format !== FORMAT || p.uid !== uid || p.root !== root || p.proxy !== PROXY || !Array.isArray(p.acceptedSshFiles) ||
+    p.binaries?.ssh !== '/usr/bin/ssh' || p.binaries?.git !== '/usr/bin/git' || p.binaries?.aws !== '@@AWS_BINARY@@') fail('PROFILE_INVALID');
+  let aliases;
+  for (const file of ['ssh_config', 'environment.sh', 'runtime.mjs', 'bin/ssh', 'bin/git', 'bin/aws']) {
+    const content = readOwned(path.join(root, file), uid);
+    const digest = sha256(content);
+    if (digest !== p.hashes?.[file]) fail('INSTALLATION_CHANGED');
+    if (file === 'ssh_config') aliases = configuredSshAliases(content);
+  }
+  if (p.codex?.enabled) {
+    for (const [file, digest] of Object.entries(p.hashes)) {
+      if (!/^(runtime\.mjs|ssh_config|environment\.sh|bin\/(ssh|git|aws|codex)|codex-route\.mjs|codex-shell-rewrite\.py|vendor\/bashlex\/[A-Za-z0-9_.-]+)$/.test(file) ||
+          !/^[a-f0-9]{64}$/.test(digest) || sha256(readOwned(path.join(root, file), uid)) !== digest) fail('CODEX_DEPENDENCY_CHANGED');
+    }
+    for (const file of ['codex-route.mjs', 'bin/codex']) {
+      if (sha256(readOwned(path.join(root, file), uid)) !== p.hashes?.[file]) fail('CODEX_INSTALLATION_CHANGED');
+    }
+    if (p.codexRelease) {
+      const release = p.codexRelease;
+      if (!/^codex-releases\/[a-f0-9]{16}$/.test(release.directory || '') ||
+          !release.hashes || typeof release.hashes !== 'object' || Array.isArray(release.hashes) ||
+          !['codex-route.mjs', 'codex-shell-rewrite.py', 'vendor/bashlex/__init__.py'].every(f => release.hashes[f])) fail('CODEX_RELEASE_INVALID');
+      for (const [file, digest] of Object.entries(release.hashes)) {
+        if (!/^(codex-route\.mjs|codex-shell-rewrite\.py|vendor\/bashlex\/[A-Za-z0-9_.-]+)$/.test(file) ||
+            !/^[a-f0-9]{64}$/.test(digest) || sha256(readOwned(path.join(root, release.directory, file), uid)) !== digest) fail('CODEX_RELEASE_CHANGED');
+      }
+    }
+  }
+  return { ...p, sshAliases: aliases };
+}
+
+export function processOrigin(run = spawnSync, initialPid = process.ppid) {
+  let pid = initialPid; const seen = new Set();
+  for (let depth = 0; depth < 10 && pid > 1 && !seen.has(pid); depth++) {
+    seen.add(pid);
+    const r = run('/bin/ps', ['-p', String(pid), '-o', 'ppid=,comm='], { encoding: 'utf8', timeout: 1500, maxBuffer: 8192 });
+    if (r.status !== 0) break;
+    const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(r.stdout);
+    if (!m) break;
+    if (m[2].startsWith('/Applications/Claude.app/Contents/')) return 'DESKTOP';
+    if (/\/\.local\/share\/claude\/versions\/|\/bin\/claude$/.test(m[2])) return 'CLI';
+    if (m[2].startsWith('/Applications/Codex.app/Contents/')) return 'CODEX_TEST';
+    pid = Number(m[1]);
+  }
+  return 'UNKNOWN';
+}
+export function writeObservation(root, event, origin = processOrigin()) {
+  if (!['BASH_PREFIX_PREPARED', 'SSH_STARTED', 'GIT_STARTED', 'AWS_STARTED'].includes(event) ||
+    !['DESKTOP', 'CLI', 'CODEX_TEST', 'UNKNOWN'].includes(origin)) fail('OBSERVATION_INVALID');
+  // Never persist command text, tool input, transcript path, environment,
+  // server addresses, API responses, credentials, session IDs or chat contents.
+  const result = { format: FORMAT, at: new Date().toISOString(), uid: process.getuid(), origin, event,
+    meaning: event === 'BASH_PREFIX_PREPARED' ? 'hook_returned_configuration_prefix' : 'configured_wrapper_started',
+    provesNetworkExit: false };
+  const dest = path.join(root, `last-${origin.toLowerCase()}-${event.toLowerCase()}.json`);
+  noSymlinks(dest);
+  const temp = path.join(root, `.observation-${crypto.randomUUID()}.tmp`);
+  fs.writeFileSync(temp, JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  fs.renameSync(temp, dest); return result;
+}
+
+async function main() {
+  const root = path.dirname(fileURLToPath(import.meta.url)), profile = loadProfile(root);
+  const [tool, ...args] = process.argv.slice(2);
+  const codexRoute = profile.codex?.enabled ? await import(pathToFileURL(path.join(root,
+    profile.codexRelease?.directory || '.', 'codex-route.mjs')).href) : null;
+  if (tool === 'hook') {
+    let input = '';
+    for await (const chunk of process.stdin) { input += chunk; if (input.length > 1048576) fail('HOOK_TOO_LARGE'); }
+    const result = hookResult(JSON.parse(input), root, codexRoute);
+    writeObservation(root, 'BASH_PREFIX_PREPARED');
+    console.log(JSON.stringify(result)); return;
+  }
+  if (tool === 'check') {
+    console.log(JSON.stringify({ installed: true, scope: 'configured-tools-only', osIsolation: false,
+      sharedConfigurationsModified: false, proxy: PROXY, codexUSRouteEnabled: Boolean(codexRoute) })); return;
+  }
+  if (tool === 'codex' && codexRoute) { await codexRoute.runCodex(args, profile); return; }
+  if (!['ssh', 'git', 'aws'].includes(tool)) fail('TOOL_REFUSED');
+  const env = childEnvironment(root);
+  const argv = tool === 'ssh' ? sshArguments(args, profile) : tool === 'git' ? gitInvocation(args, profile, env) : args;
+  writeObservation(root, `${tool.toUpperCase()}_STARTED`);
+  const child = spawn(profile.binaries[tool], argv, { env, stdio: 'inherit' });
+  child.once('error', () => { console.error('CLAUDE_TOOLS_CHILD_START_FAILED'); process.exitCode = 125; });
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => child.kill(sig));
+  child.once('exit', (code, signal) => { process.exitCode = code ?? (signal === 'SIGINT' ? 130 : 143); });
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch(e => { console.error(/^CLAUDE_(TOOLS|CODEX)_[A-Z_]+$/.test(e.message) ? e.message : 'CLAUDE_TOOLS_FAILED_REDACTED');
+    process.exitCode = process.argv[2] === 'hook' ? 2 : 125; });
+}

@@ -1,0 +1,46 @@
+// Read six specific policy keys. Never reads Chrome profiles, cookies or credentials.
+import Foundation
+import CoreFoundation
+import CryptoKit
+
+let currentUid = Int(getuid())
+guard CommandLine.arguments.count == 1, currentUid == @@MAIN_UID@@ || currentUid == @@SERVICE_UID@@,
+      getuid() == geteuid() else { exit(2) }
+let domain = "com.google.Chrome" as CFString
+let expected: [String: Any] = [
+    "ProxySettings": ["ProxyMode": "fixed_servers", "ProxyServer": "http://127.0.0.1:@@GATE_PORT@@", "ProxyBypassList": ""],
+    "QuicAllowed": false,
+    "WebRtcIPHandling": "disable_non_proxied_udp",
+    "NetworkPredictionOptions": 2
+]
+do {
+    var rows: [[String: Any]] = []
+    var snapshot: [[String: Any]] = []
+    for key in expected.keys.sorted() {
+        let value = CFPreferencesCopyAppValue(key as CFString, domain)
+        let forced = value != nil && CFPreferencesAppValueIsForced(key as CFString, domain)
+        var matches = false
+        if let value = value {
+            let actual = try JSONSerialization.data(withJSONObject: ["v": value], options: [.sortedKeys])
+            let target = try JSONSerialization.data(withJSONObject: ["v": expected[key]!], options: [.sortedKeys])
+            matches = actual == target
+        }
+        rows.append(["key": key, "present": value != nil, "forced": forced, "matches": matches])
+        snapshot.append(["key": key, "value": value ?? NSNull(), "forced": forced])
+    }
+    var conflicts: [[String: Any]] = []
+    for key in ["ProxyOverrideRules", "WebRtcIPHandlingUrl"] {
+        let value = CFPreferencesCopyAppValue(key as CFString, domain)
+        conflicts.append(["key": key, "present": value != nil])
+        snapshot.append(["key": key, "value": value ?? NSNull()])
+    }
+    let data = try JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys])
+    let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let result: [String: Any] = ["uid": currentUid, "snapshotHash": hash, "policies": rows, "conflicts": conflicts]
+    let encoded = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+    FileHandle.standardOutput.write(encoded)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+} catch {
+    FileHandle.standardError.write(Data("CHROME_POLICY_READBACK_FAILED\n".utf8))
+    exit(1)
+}

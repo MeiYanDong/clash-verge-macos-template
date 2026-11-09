@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Claude 东京浏览器防护",
+  "version": "1.0.0",
+  "description": "仅在已明确使用本机东京代理的浏览器中限制非代理 WebRTC UDP。不读取账号或 Cookies。",
+  "permissions": ["privacy", "proxy"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{"matches": ["http://127.0.0.1/*"], "js": ["bridge.js"], "run_at": "document_idle"}]
+}
